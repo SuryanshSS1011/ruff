@@ -198,8 +198,8 @@ use crate::{
     dunder_all::dunder_all_names,
     place::{DefinedPlace, Definedness, Place, RequiresExplicitReExport, imported_symbol},
     types::{
-        CallableTypes, ClassLiteral, IntersectionBuilder, KnownClass, NarrowingConstraint, Type,
-        TypeContext, UnionType, enum_metadata, infer_expression_type, infer_expression_types,
+        CallableTypes, ClassLiteral, IntersectionBuilder, KnownClass, KnownInstanceType,
+        NarrowingConstraint, Type, TypeContext, UnionType, enum_metadata, infer_expression_type,
         infer_narrowing_constraint,
     },
 };
@@ -208,17 +208,16 @@ use ruff_python_ast as ast;
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use rustc_hash::{FxHashMap, FxHashSet};
-use ty_module_resolver::{KnownModule, file_to_module};
 use ty_python_core::{
-    BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, ExpressionNodeKey,
-    FileScopeId, ScopedDefinitionId, SemanticIndex, Truthiness, UseDefMap,
+    BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, FileScopeId,
+    ScopedDefinitionId, SemanticIndex, Truthiness, UseDefMap,
     definition::DefinitionState,
     expression::Expression,
     place::ScopedPlaceId,
     place_table,
     predicate::{
-        CallableAndCallExpr, NonEmptyIterablePredicate, PatternPredicate, PatternPredicateKind,
-        Predicate, PredicateNode, ScopedPredicateId,
+        CallableAndCallExpr, PatternPredicate, PatternPredicateKind, Predicate, PredicateNode,
+        ScopedPredicateId,
     },
     reachability_constraints::{ReachabilityConstraints, ScopedReachabilityConstraintId},
 };
@@ -1134,52 +1133,12 @@ fn analyze_single_pattern_predicate_kind<'db>(
     }
 }
 
-/// Confirms that a `range(...)` call refers to builtin `range` and has literal arguments that
-/// guarantee at least one iteration.
-fn analyze_non_empty_range_call(
-    db: &dyn Db,
-    call: Expression,
-    callable: ExpressionNodeKey,
-    start: Option<ExpressionNodeKey>,
-    stop: ExpressionNodeKey,
-    step: Option<ExpressionNodeKey>,
-) -> Truthiness {
-    let inference = infer_expression_types(db, call, TypeContext::default());
-    let callable_ty = inference.expression_type(callable);
-    let Some(class) = callable_ty
-        .as_class_literal()
-        .and_then(ClassLiteral::as_static)
-    else {
-        return Truthiness::Ambiguous;
-    };
-
-    if class.name(db) != "range"
-        || !file_to_module(db, class.file(db))
-            .and_then(|module| module.known(db))
-            .is_some_and(KnownModule::is_builtins)
-    {
-        return Truthiness::Ambiguous;
-    }
-
-    let stop = inference.expression_type(stop).as_int_literal();
-    let iterates_at_least_once = match (start, stop, step) {
-        (None, Some(stop), None) => stop > 0,
-        (Some(start), Some(stop), None) => inference
-            .expression_type(start)
-            .as_int_literal()
-            .is_some_and(|start| start < stop),
-        (Some(start), Some(stop), Some(step)) => inference
-            .expression_type(start)
-            .as_int_literal()
-            .zip(inference.expression_type(step).as_int_literal())
-            .is_some_and(|(start, step)| (step > 0 && start < stop) || (step < 0 && start > stop)),
-        _ => false,
-    };
-
-    if iterates_at_least_once {
-        Truthiness::AlwaysTrue
-    } else {
-        Truthiness::Ambiguous
+fn analyze_non_empty_iterable(db: &dyn Db, iterable: Expression) -> Truthiness {
+    match infer_expression_type(db, iterable, TypeContext::default()) {
+        Type::KnownInstance(KnownInstanceType::Range { is_non_empty }) => {
+            Truthiness::from(is_non_empty)
+        }
+        _ => Truthiness::Ambiguous,
     }
 }
 
@@ -1252,14 +1211,9 @@ fn analyze_single(db: &dyn Db, predicate: &Predicate) -> Truthiness {
             .negate_if(!predicate.is_positive)
         }
         PredicateNode::Pattern(inner) => analyze_pattern_predicate(db, inner),
-        PredicateNode::IsNonEmptyIterable(NonEmptyIterablePredicate::BuiltinRange {
-            call,
-            callable,
-            start,
-            stop,
-            step,
-        }) => analyze_non_empty_range_call(db, call, callable, start, stop, step)
-            .negate_if(!predicate.is_positive),
+        PredicateNode::IsNonEmptyIterable(iterable) => {
+            analyze_non_empty_iterable(db, iterable).negate_if(!predicate.is_positive)
+        }
         PredicateNode::StarImportPlaceholder(star_import) => {
             let place_table = place_table(db, star_import.scope(db));
             let symbol = place_table.symbol(star_import.symbol_id(db));
