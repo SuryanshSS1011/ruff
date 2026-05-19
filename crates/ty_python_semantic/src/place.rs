@@ -7,7 +7,7 @@ use ty_module_resolver::{
 };
 
 use crate::dunder_all::dunder_all_names;
-use crate::reachability::{ReachabilityConstraintsExtension, ReachabilityEvaluator};
+use crate::reachability::{ReachabilityConstraintsExtension, evaluate_reachability};
 use crate::types::narrow::NarrowingEvaluatorExtension;
 use crate::types::{
     DynamicType, KnownClass, MemberLookupPolicy, Type, TypeAndQualifiers, TypeQualifiers,
@@ -1234,21 +1234,14 @@ fn loop_header_reachability_impl<'db>(
     let mut deleted_reachability = Truthiness::AlwaysFalse;
     let mut reachable_bindings = FxIndexSet::default();
     let live_bindings: Vec<_> = loop_header.bindings_for_place(place).collect();
-    let mut reachability_evaluator = ReachabilityEvaluator::new(db, use_def);
-    let loop_header_nodes =
-        reachability_evaluator.count_loop_header_nodes(live_bindings.iter().flat_map(|binding| {
-            [
-                binding.reachability_constraint(),
-                binding.narrowing_constraint(),
-            ]
-        }));
-    let use_exact_reachability = loop_header_nodes <= MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES;
+    let use_exact_reachability = use_def.reachability_constraints().used_interiors().len()
+        <= MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES;
 
     for live_binding in live_bindings {
         let reachability = if is_cycle_initial {
             Truthiness::Ambiguous
         } else if use_exact_reachability {
-            reachability_evaluator.evaluate(live_binding.reachability_constraint())
+            evaluate_reachability(db, use_def, live_binding.reachability_constraint())
         } else if live_binding.reachability_constraint()
             == ScopedReachabilityConstraintId::ALWAYS_FALSE
         {
@@ -1287,7 +1280,6 @@ fn loop_header_reachability_impl<'db>(
     LoopHeaderReachability {
         deleted_reachability,
         reachable_bindings,
-        constraint_node_count: loop_header_nodes,
     }
 }
 
@@ -1297,7 +1289,6 @@ pub(crate) struct LoopHeaderReachability<'db> {
     pub(crate) deleted_reachability: Truthiness,
     /// Reachable loop-back bindings that are not `del`s.
     pub(crate) reachable_bindings: FxIndexSet<ReachableLoopBinding<'db>>,
-    pub(crate) constraint_node_count: usize,
 }
 
 impl<'db> LoopHeaderReachability<'db> {
@@ -1318,9 +1309,6 @@ impl<'db> LoopHeaderReachability<'db> {
         LoopHeaderReachability {
             deleted_reachability: self.deleted_reachability,
             reachable_bindings,
-            constraint_node_count: self
-                .constraint_node_count
-                .max(previous.constraint_node_count),
         }
     }
 }

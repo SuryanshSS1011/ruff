@@ -2089,17 +2089,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let db = self.db();
         let loop_header = loop_header_reachability(db, definition);
-        // Loop-header types are an approximation point for loop fixpoint analysis. Inferring the
-        // exact union of every visible loop-back binding can recursively force inference of large
-        // boolean expressions and explode on real-world loops.
-        if loop_header.constraint_node_count > MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES {
-            self.bindings.insert(definition, Type::unknown());
-            return;
-        }
-
         let use_def = self
             .index
             .use_def_map(self.scope().file_scope_id(self.db()));
+
+        // Loop-header types are an approximation point for loop fixpoint analysis. Inferring the
+        // exact union of every visible loop-back binding can recursively force inference of large
+        // boolean expressions and explode on real-world loops.
+        if use_def.reachability_constraints().used_interiors().len()
+            > MAX_EXACT_LOOP_HEADER_REACHABILITY_NODES
+        {
+            self.bindings.insert(definition, Type::unknown());
+            return;
+        }
 
         let place = loop_header_kind.place();
 
@@ -7982,10 +7984,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_call_expression_impl(call_expression, callable_type, tcx)
     }
 
+    /// Infers a truthiness-refined `range` instance for literal built-in `range(...)` calls.
+    ///
+    /// The refinement only records whether the constructed range is statically non-empty. Dynamic
+    /// arguments, keyword arguments, starred arguments, shadowed `range` callables, and invalid
+    /// literal forms fall back to the ordinary `range` instance.
+    ///
+    /// This uses the argument types inferred by normal call binding; it does not re-infer
+    /// arguments just to compute the refinement.
+    ///
+    /// ```python
+    /// range(3)        # known non-empty
+    /// range(3, 0, -1) # known non-empty
+    /// range(n)        # ordinary range
+    /// ```
     fn infer_builtin_range_instance_type(
-        &mut self,
+        &self,
         callable_type: Type<'db>,
         arguments: &ast::Arguments,
+        call_arguments: &CallArguments<'_, 'db>,
     ) -> Option<Type<'db>> {
         let Type::ClassLiteral(class) = callable_type else {
             return None;
@@ -7997,20 +8014,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         }
 
-        let mut speculative = self.speculate();
-        let mut int_literal = |expr: &ast::Expr| {
-            speculative
-                .infer_expression(expr, TypeContext::default())
+        let int_literal = |argument_index: usize| {
+            call_arguments
+                .argument_types(argument_index)?
+                .get_default()?
                 .as_int_literal()
         };
 
-        let is_non_empty = match arguments.args.as_ref() {
-            [stop] => int_literal(stop)? > 0,
-            [start, stop] => int_literal(start)? < int_literal(stop)?,
-            [start, stop, step] => {
-                let start = int_literal(start)?;
-                let stop = int_literal(stop)?;
-                let step = int_literal(step)?;
+        let is_non_empty = match arguments.args.len() {
+            1 => int_literal(0)? > 0,
+            2 => int_literal(0)? < int_literal(1)?,
+            3 => {
+                let start = int_literal(0)?;
+                let stop = int_literal(1)?;
+                let step = int_literal(2)?;
 
                 match step.cmp(&0) {
                     std::cmp::Ordering::Greater => start < stop,
@@ -8483,7 +8500,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // `range(...)` always constructs a `range`, but with literal arguments we can preserve
         // whether that range is statically non-empty on the constructed instance itself.
-        if let Some(instance_ty) = self.infer_builtin_range_instance_type(callable_type, arguments)
+        if let Some(instance_ty) =
+            self.infer_builtin_range_instance_type(callable_type, arguments, &call_arguments)
         {
             bindings = bindings.with_constructed_instance_type(self.db(), instance_ty);
         }
