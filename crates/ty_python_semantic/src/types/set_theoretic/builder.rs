@@ -108,6 +108,18 @@ fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
 /// simplified.
 const MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES: usize = 64;
 
+fn consume_indexed_protocol_expansion_budget(
+    alternatives: usize,
+    remaining_budget: &mut usize,
+) -> bool {
+    let additional_alternatives = alternatives.saturating_sub(1);
+    if additional_alternatives > *remaining_budget {
+        return false;
+    }
+    *remaining_budget -= additional_alternatives;
+    true
+}
+
 /// Refine a concrete tuple instance using finite indexed constraints from a protocol.
 ///
 /// Returns `None` when `ty` is not an exact tuple instance, `Some(Never)` when the tuple shape is
@@ -1294,10 +1306,14 @@ impl<'db> IntersectionBuilder<'db> {
                 }
 
                 let mut distributed = Vec::new();
+                let mut remaining_budget = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+                    .saturating_sub(self.intersections.len());
                 for inner in self.intersections {
-                    distributed.extend(
-                        inner.add_positive_distributing_indexed_protocol_negatives(self.db, ty),
-                    );
+                    distributed.extend(inner.add_positive_distributing_indexed_protocol_negatives(
+                        self.db,
+                        ty,
+                        &mut remaining_budget,
+                    ));
                 }
                 self.intersections = distributed;
                 self
@@ -1378,10 +1394,16 @@ impl<'db> IntersectionBuilder<'db> {
                     && indexed.is_entire_interface()
                 {
                     let mut distributed = Vec::new();
+                    let mut remaining_budget = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+                        .saturating_sub(self.intersections.len());
 
                     for mut inner in self.intersections {
                         if let Some(alternatives) =
                             inner.subtract_indexed_protocol(self.db, &indexed)
+                            && consume_indexed_protocol_expansion_budget(
+                                alternatives.len(),
+                                &mut remaining_budget,
+                            )
                         {
                             distributed.extend(alternatives);
                         } else {
@@ -1438,6 +1460,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
         mut self,
         db: &'db dyn Db,
         new_positive: Type<'db>,
+        remaining_budget: &mut usize,
     ) -> Vec<Self> {
         let applicable_negative = self
             .negative
@@ -1460,14 +1483,24 @@ impl<'db> InnerIntersectionBuilder<'db> {
             return vec![self];
         };
 
+        if !consume_indexed_protocol_expansion_budget(remaining_types.len(), remaining_budget) {
+            self.add_positive(db, new_positive);
+            return vec![self];
+        }
+
         self.negative.swap_remove_index(negative_index);
-        remaining_types
-            .into_iter()
-            .flat_map(|remaining| {
+        let mut alternatives = Vec::new();
+        for remaining in remaining_types {
+            alternatives.extend(
                 self.clone()
-                    .add_positive_distributing_indexed_protocol_negatives(db, remaining)
-            })
-            .collect()
+                    .add_positive_distributing_indexed_protocol_negatives(
+                        db,
+                        remaining,
+                        remaining_budget,
+                    ),
+            );
+        }
+        alternatives
     }
 
     /// Distribute negation of finite indexed protocol constraints over tuple positives.
@@ -2071,6 +2104,7 @@ mod tests {
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::{global_symbol, known_module_symbol};
     use crate::types::enums::enum_member_literals;
+    use crate::types::match_pattern::exact_sequence_pattern_type;
     use crate::types::protocol_class::FiniteIndexedProtocolConstraint;
     use crate::types::type_alias::TypeAliasType;
     use crate::types::{KnownClass, KnownInstanceType, Truthiness};
@@ -2183,6 +2217,52 @@ mod tests {
             subtract_indexed_protocol_from_tuple(&db, tuple, &protocol),
             None
         );
+    }
+
+    #[test]
+    fn indexed_protocol_complement_expansion_is_cumulatively_bounded() {
+        let db = setup_db();
+        let element_types = [
+            KnownClass::Int.to_instance(&db),
+            KnownClass::Str.to_instance(&db),
+            KnownClass::Bytes.to_instance(&db),
+            KnownClass::Float.to_instance(&db),
+        ];
+        let element = UnionType::from_elements(&db, element_types);
+        let tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, 4));
+        let protocols = element_types.map(|excluded| {
+            let pattern = exact_sequence_pattern_type(&db, &[excluded; 4]);
+            let Type::Intersection(pattern) = pattern else {
+                panic!("Expected exact sequence pattern to be an intersection");
+            };
+            *pattern
+                .positive(&db)
+                .iter()
+                .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+                .expect("Expected exact sequence pattern to contain a protocol")
+        });
+
+        let assert_bounded = |builder: &IntersectionBuilder<'_>| {
+            assert!(builder.intersections.len() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES);
+            assert!(builder.intersections.iter().any(|inner| {
+                inner
+                    .negative
+                    .iter()
+                    .any(|negative| matches!(negative, Type::ProtocolInstance(_)))
+            }));
+        };
+
+        let mut builder = IntersectionBuilder::new(&db).add_positive(tuple);
+        for protocol in protocols {
+            builder = builder.add_negative(protocol);
+        }
+        assert_bounded(&builder);
+
+        let mut builder = IntersectionBuilder::new(&db);
+        for protocol in protocols {
+            builder = builder.add_negative(protocol);
+        }
+        assert_bounded(&builder.add_positive(tuple));
     }
 
     #[test]
