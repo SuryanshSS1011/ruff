@@ -52,7 +52,7 @@ use crate::types::signatures::{
     PartialApplication, PartialSignatureApplication,
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleType};
-use crate::types::typed_dict::extract_unpacked_typed_dict_keys_from_value_type;
+use crate::types::typed_dict::extract_unpacked_typed_dict_from_value_type;
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::{
     BoundMethodType, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral,
@@ -2877,7 +2877,11 @@ impl<'db> CallableBinding<'db> {
                             continue;
                         }
                         relevant_count += 1;
-                        if matches!(error, BindingError::UnknownArgument { .. }) {
+                        if matches!(
+                            error,
+                            BindingError::UnknownArgument { .. }
+                                | BindingError::UnknownKeywordVariadicArgument { .. }
+                        ) {
                             unknown_argument_count += 1;
                         }
                     }
@@ -4479,11 +4483,11 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         argument_index: usize,
         argument_type: Option<Type<'db>>,
     ) {
-        if let Some(unpacked_keys) =
-            argument_type.and_then(|ty| extract_unpacked_typed_dict_keys_from_value_type(db, ty))
+        if let Some(unpacked) =
+            argument_type.and_then(|ty| extract_unpacked_typed_dict_from_value_type(db, ty))
         {
             // Special case TypedDict-shaped values because we know which keys are present.
-            for (name, unpacked_key) in unpacked_keys {
+            for (name, unpacked_key) in unpacked.keys {
                 let _ = self.match_keyword(
                     argument_index,
                     Argument::Keywords,
@@ -4491,7 +4495,11 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     name.as_str(),
                 );
             }
-            self.match_open_typed_dict_extra_items(argument_index);
+            if let Some(extra_items_ty) = unpacked.extra_items_ty {
+                self.match_typed_dict_extra_items(argument_index, extra_items_ty);
+            } else if !unpacked.is_closed {
+                self.match_open_typed_dict_extra_items(argument_index);
+            }
         } else {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
                 if self.parameter_info[parameter_index].matched && !parameter.is_keyword_variadic()
@@ -4554,6 +4562,54 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             false,
             true,
         );
+    }
+
+    /// Match the possible arbitrary keyword arguments exposed by explicit `TypedDict` extra items.
+    ///
+    /// Extra items are non-required, so they can constrain named parameters without satisfying
+    /// required parameters. Any remaining names are accepted only by a keyword-variadic parameter.
+    fn match_typed_dict_extra_items(&mut self, argument_index: usize, extra_items_ty: Type<'db>) {
+        let mut has_keyword_variadic = false;
+
+        for (parameter_index, parameter) in self.parameters.iter().enumerate() {
+            if self.parameter_info[parameter_index].matched && !parameter.is_keyword_variadic() {
+                continue;
+            }
+            if matches!(
+                parameter.kind(),
+                ParameterKind::PositionalOnly { .. } | ParameterKind::Variadic { .. }
+            ) {
+                continue;
+            }
+
+            if parameter.is_keyword_variadic() {
+                has_keyword_variadic = true;
+                self.assign_argument(
+                    argument_index,
+                    Argument::Keywords,
+                    Some(extra_items_ty),
+                    InvalidArgumentTypeProvenance::Argument,
+                    parameter_index,
+                    parameter,
+                    false,
+                    true,
+                );
+            } else {
+                let matched_argument = &mut self.argument_matches[argument_index];
+                matched_argument.parameters.push(MatchedParameter {
+                    index: parameter_index,
+                    argument_type: Some(extra_items_ty),
+                    provenance: InvalidArgumentTypeProvenance::Argument,
+                });
+            }
+        }
+
+        if !has_keyword_variadic {
+            self.errors
+                .push(BindingError::UnknownKeywordVariadicArgument {
+                    argument_index: self.get_argument_index(argument_index),
+                });
+        }
     }
 
     fn finish(self) -> Box<[MatchedArgument<'db>]> {
@@ -5379,7 +5435,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         argument_type: Type<'db>,
         paramspec_component_start: Option<usize>,
     ) {
-        if extract_unpacked_typed_dict_keys_from_value_type(self.db, argument_type).is_some() {
+        if extract_unpacked_typed_dict_from_value_type(self.db, argument_type).is_some() {
             for matched_parameter in self.argument_matches[argument_index].iter() {
                 let parameter_index = matched_parameter.index;
                 if paramspec_component_start.is_some_and(|start| parameter_index >= start) {
@@ -6270,6 +6326,7 @@ impl<'db> Binding<'db> {
                 error,
                 BindingError::MissingArguments { .. }
                     | BindingError::UnknownArgument { .. }
+                    | BindingError::UnknownKeywordVariadicArgument { .. }
                     | BindingError::PositionalOnlyParameterAsKwarg { .. }
                     | BindingError::TooManyPositionalArguments { .. }
                     | BindingError::ParameterAlreadyAssigned { .. }
@@ -6770,6 +6827,10 @@ pub(crate) enum BindingError<'db> {
         argument_name: ast::name::Name,
         argument_index: Option<usize>,
     },
+    /// An unpacked keyword argument may contain names that don't match any parameter.
+    UnknownKeywordVariadicArgument {
+        argument_index: Option<usize>,
+    },
     /// A positional-only parameter is passed as keyword argument.
     PositionalOnlyParameterAsKwarg {
         argument_index: Option<usize>,
@@ -6823,6 +6884,7 @@ impl BindingError<'_> {
             Self::InvalidArgumentType { .. }
                 | Self::InvalidKeyType { .. }
                 | Self::UnknownArgument { .. }
+                | Self::UnknownKeywordVariadicArgument { .. }
                 | Self::PositionalOnlyParameterAsKwarg { .. }
                 | Self::TooManyPositionalArguments { .. }
                 | Self::ParameterAlreadyAssigned { .. }
@@ -6871,6 +6933,7 @@ impl BindingError<'_> {
             BindingError::InvalidArgumentType { argument_index, .. }
             | BindingError::InvalidKeyType { argument_index, .. }
             | BindingError::UnknownArgument { argument_index, .. }
+            | BindingError::UnknownKeywordVariadicArgument { argument_index }
             | BindingError::PositionalOnlyParameterAsKwarg { argument_index, .. }
             | BindingError::ParameterAlreadyAssigned { argument_index, .. }
             | BindingError::SpecializationError { argument_index, .. } => {
@@ -6957,6 +7020,7 @@ impl<'db> BindingError<'db> {
             | Self::InvalidKeyType { .. }
             | Self::MissingArguments { .. }
             | Self::UnknownArgument { .. }
+            | Self::UnknownKeywordVariadicArgument { .. }
             | Self::PositionalOnlyParameterAsKwarg { .. }
             | Self::TooManyPositionalArguments { .. }
             | Self::ParameterAlreadyAssigned { .. }
@@ -7226,6 +7290,28 @@ impl<'db> BindingError<'db> {
                 if let Some(builder) = context.report_lint(&UNKNOWN_ARGUMENT, node) {
                     let mut diag = builder.into_diagnostic(format_args!(
                         "Argument `{argument_name}` does not match any known parameter{}",
+                        callable_description
+                            .map(|description| format!(" of {description}"))
+                            .unwrap_or_default()
+                    ));
+                    if let Some(compound_diag) = compound_diag {
+                        compound_diag.add_context(context.db(), &mut diag);
+                    } else if let Some(spans) = callable_ty.function_spans(context.db()) {
+                        let mut sub = SubDiagnostic::new(
+                            SubDiagnosticSeverity::Info,
+                            format_args!("{callable_kind} signature here"),
+                        );
+                        sub.annotate(Annotation::primary(spans.signature));
+                        diag.sub(sub);
+                    }
+                }
+            }
+
+            Self::UnknownKeywordVariadicArgument { argument_index } => {
+                let node = Self::get_node(node, *argument_index);
+                if let Some(builder) = context.report_lint(&UNKNOWN_ARGUMENT, node) {
+                    let mut diag = builder.into_diagnostic(format_args!(
+                        "Unpacked argument may contain keyword arguments that do not match any known parameter{}",
                         callable_description
                             .map(|description| format!(" of {description}"))
                             .unwrap_or_default()
