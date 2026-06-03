@@ -41,6 +41,7 @@ use crate::types::enums::{EnumComplement, enum_metadata};
 use crate::types::protocol_class::FiniteIndexedProtocolConstraint;
 use crate::types::set_theoretic::expand_intersection_typevars_and_newtypes;
 use crate::types::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
+use crate::types::visitor::any_over_type;
 use crate::types::{
     BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType, KnownClass,
     LiteralValueType, LiteralValueTypeKind, NegativeIntersectionElements, StringLiteralType,
@@ -92,8 +93,13 @@ fn split_truthiness_guarded_intersection<'db>(
     Some((core.build(), guard))
 }
 
+/// Return whether tuple or protocol elements can be refined set-theoretically.
+///
+/// Dynamic types can be hidden behind aliases, so checking only the top-level types is insufficient.
 fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
-    elements.iter().all(|element| !element.has_dynamic(db))
+    elements
+        .iter()
+        .all(|element| !any_over_type(db, *element, true, |ty| ty.is_dynamic()))
 }
 
 /// Refine a concrete tuple instance using finite indexed constraints from a protocol.

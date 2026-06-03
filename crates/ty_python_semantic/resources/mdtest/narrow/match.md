@@ -324,6 +324,32 @@ def test_match_value_sequence(value: object) -> None:
             reveal_type(value[0])  # revealed: object
 ```
 
+## Exact sequence patterns do not refine aliased `Any`
+
+For a fully static tuple, an exact sequence pattern can refine the tuple's element types. For
+example, matching `tuple[int | str]` against `[int()]` can refine it to `tuple[int]`.
+
+`Any` is gradual, so refining `tuple[Any]` to `tuple[int]` would discard the gradual element type.
+The intersection must remain symbolic, including when `Any` is hidden behind a PEP 695 type alias.
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from typing import Any
+
+type AliasedAny = Any
+
+def test_aliased_any_prevents_exact_sequence_tuple_refinement(value: tuple[AliasedAny]) -> None:
+    match value:
+        case [int()]:
+            # Do not simplify this to `tuple[int]`; the element type is gradual.
+            # revealed: tuple[AliasedAny] & <Protocol with members '__getitem__', '__len__'>
+            reveal_type(value)
+```
+
 ## Value patterns
 
 Value patterns are evaluated by equality, which is overridable. Therefore successfully matching on
