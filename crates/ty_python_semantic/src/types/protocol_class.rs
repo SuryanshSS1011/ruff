@@ -185,35 +185,6 @@ pub(super) struct ProtocolInterface<'db> {
 
 impl get_size2::GetSize for ProtocolInterface<'_> {}
 
-/// Structural constraints for a value with a statically known length and one type constraint per
-/// integer index.
-///
-/// This is intentionally not a tuple type. Protocols state member constraints; consumers can use
-/// these indexed facts to refine any representation that models the same operations.
-pub(super) struct FiniteIndexedProtocolConstraint<'db> {
-    element_types: Box<[Type<'db>]>,
-    is_entire_interface: bool,
-}
-
-impl<'db> FiniteIndexedProtocolConstraint<'db> {
-    pub(super) fn element_types(&self) -> &[Type<'db>] {
-        &self.element_types
-    }
-
-    #[cfg(test)]
-    pub(super) fn from_element_types(element_types: Vec<Type<'db>>) -> Self {
-        Self {
-            element_types: element_types.into_boxed_slice(),
-            is_entire_interface: true,
-        }
-    }
-
-    /// Return `true` if the indexed facts account for every member in the protocol interface.
-    pub(super) fn is_entire_interface(&self) -> bool {
-        self.is_entire_interface
-    }
-}
-
 pub(super) fn walk_protocol_interface<'db, V: super::visitor::TypeVisitor<'db> + ?Sized>(
     db: &'db dyn Db,
     interface: ProtocolInterface<'db>,
@@ -352,13 +323,9 @@ impl<'db> ProtocolInterface<'db> {
 
     /// Return the finite indexed constraints described by this protocol's methods, if any.
     ///
-    /// This recognizes protocols with a literal-returning `__len__` method and one indexed
-    /// `__getitem__` overload per element. Additional protocol members are not included in the
-    /// returned constraints.
-    pub(super) fn finite_indexed_constraint(
-        self,
-        db: &'db dyn Db,
-    ) -> Option<FiniteIndexedProtocolConstraint<'db>> {
+    /// This recognizes protocols whose entire interface consists of a literal-returning `__len__`
+    /// method and one indexed `__getitem__` overload per element.
+    pub(super) fn finite_indexed_constraint(self, db: &'db dyn Db) -> Option<Box<[Type<'db>]>> {
         fn exact_int_literal(db: &dyn Db, ty: Type<'_>) -> Option<i64> {
             match ty.resolve_type_alias(db) {
                 Type::Union(union) => {
@@ -393,10 +360,10 @@ impl<'db> ProtocolInterface<'db> {
 
         let length = usize::try_from(exact_int_literal(db, len_signature.return_ty)?).ok()?;
         if length == 0 {
-            return Some(FiniteIndexedProtocolConstraint {
-                element_types: Box::default(),
-                is_entire_interface: self.member_count(db) == 1,
-            });
+            return (self.member_count(db) == 1).then_some(Box::default());
+        }
+        if self.member_count(db) != 2 {
+            return None;
         }
 
         let ProtocolMemberKind::Method(getitem_method) =
@@ -425,10 +392,7 @@ impl<'db> ProtocolInterface<'db> {
         if elements.len() != length {
             return None;
         }
-        Some(FiniteIndexedProtocolConstraint {
-            element_types: elements.into_values().collect(),
-            is_entire_interface: self.member_count(db) == 2,
-        })
+        Some(elements.into_values().collect())
     }
 
     pub(super) fn instance_member(self, db: &'db dyn Db, name: &str) -> PlaceAndQualifiers<'db> {
