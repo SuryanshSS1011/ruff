@@ -1452,55 +1452,53 @@ struct InnerIntersectionBuilder<'db> {
 }
 
 impl<'db> InnerIntersectionBuilder<'db> {
-    /// Add a positive type after distributing any finite indexed protocol complements that
-    /// constrain it.
+    /// Add a positive type, then distribute any finite indexed protocol complements that constrain
+    /// the resulting positives.
     ///
-    /// This handles intersections where a negated protocol is added before a tuple.
+    /// Adding a protocol can refine a variadic tuple into a fixed tuple, so distribution must
+    /// happen after the positive has been normalized.
     fn add_positive_distributing_indexed_protocol_negatives(
         mut self,
         db: &'db dyn Db,
         new_positive: Type<'db>,
         remaining_budget: &mut usize,
     ) -> Vec<Self> {
-        let applicable_negative = self
-            .negative
-            .iter()
-            .enumerate()
-            .find_map(|(index, negative)| {
-                let Type::ProtocolInstance(protocol) = negative else {
-                    return None;
-                };
-                let indexed = protocol.finite_indexed_constraint(db)?;
-                if !indexed.is_entire_interface() {
-                    return None;
-                }
-                subtract_indexed_protocol_from_tuple(db, new_positive, &indexed)
-                    .map(|remaining| (index, remaining))
-            });
+        self.add_positive(db, new_positive);
+        self.distribute_indexed_protocol_negatives(db, remaining_budget)
+    }
 
-        let Some((negative_index, remaining_types)) = applicable_negative else {
-            self.add_positive(db, new_positive);
+    fn distribute_indexed_protocol_negatives(
+        self,
+        db: &'db dyn Db,
+        remaining_budget: &mut usize,
+    ) -> Vec<Self> {
+        let applicable_negative = self.negative.iter().find_map(|negative| {
+            let Type::ProtocolInstance(protocol) = negative else {
+                return None;
+            };
+            let indexed = protocol.finite_indexed_constraint(db)?;
+            if !indexed.is_entire_interface() {
+                return None;
+            }
+            self.subtract_indexed_protocol(db, &indexed)
+                .map(|alternatives| (*negative, alternatives))
+        });
+
+        let Some((negative, alternatives)) = applicable_negative else {
             return vec![self];
         };
 
-        if !consume_indexed_protocol_expansion_budget(remaining_types.len(), remaining_budget) {
-            self.add_positive(db, new_positive);
+        if !consume_indexed_protocol_expansion_budget(alternatives.len(), remaining_budget) {
             return vec![self];
         }
 
-        self.negative.swap_remove_index(negative_index);
-        let mut alternatives = Vec::new();
-        for remaining in remaining_types {
-            alternatives.extend(
-                self.clone()
-                    .add_positive_distributing_indexed_protocol_negatives(
-                        db,
-                        remaining,
-                        remaining_budget,
-                    ),
-            );
+        let mut distributed = Vec::new();
+        for mut alternative in alternatives {
+            alternative.negative.swap_remove(&negative);
+            distributed
+                .extend(alternative.distribute_indexed_protocol_negatives(db, remaining_budget));
         }
-        alternatives
+        distributed
     }
 
     /// Distribute negation of finite indexed protocol constraints over tuple positives.

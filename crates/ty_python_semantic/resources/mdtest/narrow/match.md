@@ -260,6 +260,23 @@ def test_match_exact_tuple_sequence(subj: tuple[int | str, int | str]) -> None:
             reveal_type(subj[0])  # revealed: int | str
             reveal_type(subj[1])  # revealed: int
 
+def test_match_exact_variadic_tuple_negative_then_length(value: tuple[int | str, ...]) -> None:
+    match value:
+        case [int()]:
+            return
+    match value:
+        case [_]:
+            reveal_type(value)  # revealed: tuple[str]
+
+def test_match_exact_variadic_tuple_length_then_negative(value: tuple[int | str, ...]) -> None:
+    match value:
+        case [_]:
+            match value:
+                case [int()]:
+                    return
+                case _:
+                    reveal_type(value)  # revealed: tuple[str]
+
 def test_match_exact_tuple_sequence_is_exhaustive(value: int | tuple[int, int]) -> int:
     match value:
         case int(value):
