@@ -38,7 +38,9 @@
 
 use super::RecursivelyDefined;
 use crate::types::enums::{EnumComplement, enum_metadata};
+use crate::types::protocol_class::FiniteIndexedProtocolConstraint;
 use crate::types::set_theoretic::expand_intersection_typevars_and_newtypes;
+use crate::types::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
 use crate::types::{
     BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType, KnownClass,
     LiteralValueType, LiteralValueTypeKind, NegativeIntersectionElements, StringLiteralType,
@@ -88,6 +90,104 @@ fn split_truthiness_guarded_intersection<'db>(
         core = core.add_negative(*negative);
     }
     Some((core.build(), guard))
+}
+
+fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
+    elements.iter().all(|element| !element.has_dynamic(db))
+}
+
+/// Refine a concrete tuple instance using finite indexed constraints from a protocol.
+///
+/// Returns `None` when `ty` is not an exact tuple instance, `Some(Never)` when the tuple shape is
+/// disjoint from the protocol, and the refined tuple type otherwise.
+fn refine_tuple_with_indexed_protocol<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    protocol: &FiniteIndexedProtocolConstraint<'db>,
+) -> Option<Type<'db>> {
+    if !all_elements_are_static(db, protocol.element_types()) {
+        return None;
+    }
+
+    let Type::NominalInstance(instance) = ty else {
+        return None;
+    };
+
+    let tuple = instance.own_tuple_spec(db)?;
+    if !all_elements_are_static(db, tuple.all_elements()) {
+        return None;
+    }
+
+    let protocol_tuple = TupleSpec::heterogeneous(protocol.element_types().iter().copied());
+    let Some(refined) = TupleSpecBuilder::from(tuple.as_ref()).intersect(db, &protocol_tuple)
+    else {
+        return Some(Type::Never);
+    };
+
+    Some(Type::tuple(TupleType::new(db, &refined.build())))
+}
+
+/// Subtract finite indexed constraints from a fixed-length tuple type.
+///
+/// The returned alternatives are the remaining tuple shapes. An empty vector means the tuple was
+/// fully covered by the protocol; `None` means `ty` is not an exact fixed tuple and the caller
+/// should use a less precise fallback.
+fn subtract_indexed_protocol_from_tuple<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    protocol: &FiniteIndexedProtocolConstraint<'db>,
+) -> Option<Vec<Type<'db>>> {
+    if !all_elements_are_static(db, protocol.element_types()) {
+        return None;
+    }
+
+    let Type::NominalInstance(instance) = ty else {
+        return None;
+    };
+    let tuple = instance.own_tuple_spec(db)?;
+
+    let TupleSpec::Fixed(tuple) = tuple.as_ref() else {
+        return None;
+    };
+    if !all_elements_are_static(db, tuple.all_elements()) {
+        return None;
+    }
+
+    if tuple.len() != protocol.element_types().len() {
+        return Some(vec![ty]);
+    }
+
+    let mut alternatives = Vec::new();
+
+    for (index, (element, protocol_element)) in tuple
+        .all_elements()
+        .iter()
+        .zip(protocol.element_types())
+        .enumerate()
+    {
+        if element.is_disjoint_from(db, *protocol_element) {
+            return Some(vec![ty]);
+        }
+
+        if element.is_subtype_of(db, *protocol_element) {
+            continue;
+        }
+
+        let remaining_element = IntersectionBuilder::new(db)
+            .add_positive(*element)
+            .add_negative(*protocol_element)
+            .build();
+
+        if remaining_element.is_never() {
+            continue;
+        }
+
+        let mut elements = tuple.all_elements().to_vec();
+        elements[index] = remaining_element;
+        alternatives.push(Type::tuple(TupleType::heterogeneous(db, elements)));
+    }
+
+    Some(alternatives)
 }
 
 /// Try to merge a complementary guarded pair into an unguarded core.
@@ -1143,9 +1243,30 @@ impl<'db> IntersectionBuilder<'db> {
             _ => {
                 // If we are already a union-of-intersections, distribute the new intersected element
                 // across all of those intersections.
-                for inner in &mut self.intersections {
-                    inner.add_positive(self.db, ty);
+                if !self.intersections.iter().any(|inner| {
+                    inner.negative.iter().any(|negative| {
+                        let Type::ProtocolInstance(protocol) = negative else {
+                            return false;
+                        };
+                        protocol
+                            .interface(self.db)
+                            .finite_indexed_constraint(self.db)
+                            .is_some_and(|indexed| indexed.is_entire_interface())
+                    })
+                }) {
+                    for inner in &mut self.intersections {
+                        inner.add_positive(self.db, ty);
+                    }
+                    return self;
                 }
+
+                let mut distributed = Vec::new();
+                for inner in self.intersections {
+                    distributed.extend(
+                        inner.add_positive_distributing_indexed_protocol_negatives(self.db, ty),
+                    );
+                }
+                self.intersections = distributed;
                 self
             }
         }
@@ -1219,6 +1340,29 @@ impl<'db> IntersectionBuilder<'db> {
                 self.add_negative_impl(complement.to_intersection(db), seen_aliases)
             }
             _ => {
+                if let Type::ProtocolInstance(protocol) = ty
+                    && let Some(indexed) = protocol
+                        .interface(self.db)
+                        .finite_indexed_constraint(self.db)
+                    && indexed.is_entire_interface()
+                {
+                    let mut distributed = Vec::new();
+
+                    for mut inner in self.intersections {
+                        if let Some(alternatives) =
+                            inner.subtract_indexed_protocol(self.db, &indexed)
+                        {
+                            distributed.extend(alternatives);
+                        } else {
+                            inner.add_negative(self.db, ty);
+                            distributed.push(inner);
+                        }
+                    }
+
+                    self.intersections = distributed;
+                    return self;
+                }
+
                 for inner in &mut self.intersections {
                     inner.add_negative(self.db, ty);
                 }
@@ -1255,6 +1399,79 @@ struct InnerIntersectionBuilder<'db> {
 }
 
 impl<'db> InnerIntersectionBuilder<'db> {
+    /// Add a positive type after distributing any finite indexed protocol complements that
+    /// constrain it.
+    ///
+    /// This handles intersections where a negated protocol is added before a tuple.
+    fn add_positive_distributing_indexed_protocol_negatives(
+        mut self,
+        db: &'db dyn Db,
+        new_positive: Type<'db>,
+    ) -> Vec<Self> {
+        let applicable_negative = self
+            .negative
+            .iter()
+            .enumerate()
+            .find_map(|(index, negative)| {
+                let Type::ProtocolInstance(protocol) = negative else {
+                    return None;
+                };
+                let indexed = protocol.interface(db).finite_indexed_constraint(db)?;
+                if !indexed.is_entire_interface() {
+                    return None;
+                }
+                subtract_indexed_protocol_from_tuple(db, new_positive, &indexed)
+                    .map(|remaining| (index, remaining))
+            });
+
+        let Some((negative_index, remaining_types)) = applicable_negative else {
+            self.add_positive(db, new_positive);
+            return vec![self];
+        };
+
+        self.negative.swap_remove_index(negative_index);
+        remaining_types
+            .into_iter()
+            .flat_map(|remaining| {
+                self.clone()
+                    .add_positive_distributing_indexed_protocol_negatives(db, remaining)
+            })
+            .collect()
+    }
+
+    /// Distribute negation of finite indexed protocol constraints over tuple positives.
+    ///
+    /// For example, subtracting the pattern `(int(), str())` from
+    /// `tuple[int | str, int | str]` produces alternatives that exclude one
+    /// matching element position at a time.
+    fn subtract_indexed_protocol(
+        &self,
+        db: &'db dyn Db,
+        protocol: &FiniteIndexedProtocolConstraint<'db>,
+    ) -> Option<Vec<Self>> {
+        for (index, existing_positive) in self.positive.iter().enumerate() {
+            let Some(remaining_types) =
+                subtract_indexed_protocol_from_tuple(db, *existing_positive, protocol)
+            else {
+                continue;
+            };
+
+            let mut alternatives = Vec::with_capacity(remaining_types.len());
+            for remaining in remaining_types {
+                let mut alternative = self.clone();
+                alternative.positive.swap_remove_index(index);
+                alternative.add_positive(db, remaining);
+                if !alternative.positive.contains(&Type::Never) {
+                    alternatives.push(alternative);
+                }
+            }
+
+            return Some(alternatives);
+        }
+
+        None
+    }
+
     /// Return `true` when an intersection excludes every member of an enum class.
     ///
     /// This recognizes enum complements that have become empty, such as
@@ -1422,6 +1639,46 @@ impl<'db> InnerIntersectionBuilder<'db> {
 
                 let addition_is_bool_instance = positive_as_instance
                     .is_some_and(|instance| instance.has_known_class(db, KnownClass::Bool));
+
+                if let Type::ProtocolInstance(protocol) = new_positive
+                    && let Some(indexed) = protocol.interface(db).finite_indexed_constraint(db)
+                    && let Some((index, refined)) =
+                        self.positive
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, existing_positive)| {
+                                refine_tuple_with_indexed_protocol(db, *existing_positive, &indexed)
+                                    .map(|refined| (index, refined))
+                            })
+                {
+                    self.positive.swap_remove_index(index);
+                    self.add_positive(db, refined);
+                    if indexed.is_entire_interface() || self.positive.contains(&Type::Never) {
+                        return;
+                    }
+                }
+
+                if let Some((index, indexed, refined)) =
+                    self.positive
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, existing_positive)| {
+                            let Type::ProtocolInstance(protocol) = existing_positive else {
+                                return None;
+                            };
+                            let indexed = protocol.interface(db).finite_indexed_constraint(db)?;
+                            let refined =
+                                refine_tuple_with_indexed_protocol(db, new_positive, &indexed)?;
+                            Some((index, indexed, refined))
+                        })
+                {
+                    if indexed.is_entire_interface() {
+                        self.positive.swap_remove_index(index);
+                        self.add_positive(db, refined);
+                        return;
+                    }
+                    new_positive = refined;
+                }
 
                 for (index, existing_positive) in self.positive.iter().enumerate() {
                     match existing_positive {
