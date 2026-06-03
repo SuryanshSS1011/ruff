@@ -357,3 +357,8 @@ pub(crate) const fn is_collapsible_if_fix_safe_enabled(settings: &LinterSettings
 pub(crate) const fn is_ruff_ignore_enabled(settings: &LinterSettings) -> bool {
     settings.preview.is_enabled()
 }
+
+// https://github.com/astral-sh/ruff/pull/TODO
+pub(crate) const fn is_human_readable_names_enabled(preview: PreviewMode) -> bool {
+    preview.is_enabled()
+}
