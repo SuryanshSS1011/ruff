@@ -341,6 +341,9 @@ impl<'db> CallableSignature<'db> {
                                         })
                                         .chain(signature.parameters().iter().cloned()),
                                 )
+                                .with_hidden_open_typed_dict_tail(
+                                    signature.parameters().has_hidden_open_typed_dict_tail,
+                                )
                             },
                             return_ty: self_signature.return_ty.apply_type_mapping_impl(
                                 db,
@@ -2314,7 +2317,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         db,
                         CallableSignature::single(Signature::new_generic(
                             source.generic_context,
-                            Parameters::new(db, source_params.cloned()),
+                            Parameters::new(db, source_params.cloned())
+                                .with_hidden_open_typed_dict_tail(
+                                    source.parameters.has_hidden_open_typed_dict_tail,
+                                ),
                             Type::unknown(),
                         )),
                         CallableTypeKind::ParamSpecValue,
@@ -2447,7 +2453,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         db,
                         CallableSignature::single(Signature::new_generic(
                             target.generic_context,
-                            Parameters::new(db, target_params.cloned()),
+                            Parameters::new(db, target_params.cloned())
+                                .with_hidden_open_typed_dict_tail(
+                                    target.parameters.has_hidden_open_typed_dict_tail,
+                                ),
                             Type::unknown(),
                         )),
                         CallableTypeKind::ParamSpecValue,
@@ -3751,6 +3760,11 @@ impl<'db> Parameters<'db> {
         expanded.extend_from_slice(&self.value[variadic_index + 2..]);
         Parameters::new(db, expanded)
             .with_hidden_open_typed_dict_tail(self.has_hidden_open_typed_dict_tail)
+            .with_hidden_open_typed_dict_tail(
+                mapped_signature
+                    .parameters()
+                    .has_hidden_open_typed_dict_tail,
+            )
     }
 }
 
