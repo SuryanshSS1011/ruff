@@ -52,9 +52,7 @@ use crate::types::signatures::{
     PartialApplication, PartialSignatureApplication,
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleType};
-use crate::types::typed_dict::{
-    UnpackedTypedDictTail, extract_unpacked_typed_dict_from_value_type,
-};
+use crate::types::typed_dict::{TypedDictOpenness, extract_unpacked_typed_dict_from_value_type};
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::{
     BoundMethodType, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral,
@@ -4488,7 +4486,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         if let Some(unpacked) =
             argument_type.and_then(|ty| extract_unpacked_typed_dict_from_value_type(db, ty))
         {
-            let tail = unpacked.tail;
+            let openness = unpacked.openness;
 
             // Special case TypedDict-shaped values because we know which keys are present.
             for (name, unpacked_key) in unpacked.keys {
@@ -4499,7 +4497,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     name.as_str(),
                 );
             }
-            self.match_typed_dict_tail(argument_index, tail);
+            self.match_typed_dict_openness(argument_index, openness);
         } else {
             for (parameter_index, parameter) in self.parameters.iter().enumerate() {
                 if self.parameter_info[parameter_index].matched && !parameter.is_keyword_variadic()
@@ -4541,15 +4539,21 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
         }
     }
 
-    /// Match the possible arbitrary keyword arguments represented by a `TypedDict` tail.
+    /// Match the possible arbitrary keyword arguments represented by a `TypedDict`'s openness.
     ///
-    /// Explicit tail items can constrain named parameters without satisfying required parameters,
-    /// and require a keyword-variadic parameter to accept all remaining names. A hidden open tail
+    /// Explicit extra items can constrain named parameters without satisfying required parameters,
+    /// and require a keyword-variadic parameter to accept all remaining names. An open `TypedDict`
     /// only constrains an existing keyword-variadic parameter.
-    fn match_typed_dict_tail(&mut self, argument_index: usize, tail: UnpackedTypedDictTail<'db>) {
-        let Some(extra_items_ty) = tail.value_ty() else {
+    fn match_typed_dict_openness(
+        &mut self,
+        argument_index: usize,
+        openness: TypedDictOpenness<'db>,
+    ) {
+        let Some(extra_items) = openness.effective_extra_items() else {
             return;
         };
+        let extra_items_ty = extra_items.declared_ty;
+        let has_explicit_extra_items = openness.explicit_extra_items().is_some();
         let mut has_keyword_variadic = false;
 
         for (parameter_index, parameter) in self.parameters.iter().enumerate() {
@@ -4569,7 +4573,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     argument_index,
                     Argument::Keywords,
                     Some(extra_items_ty),
-                    if matches!(tail, UnpackedTypedDictTail::Hidden) {
+                    if openness.is_open() {
                         InvalidArgumentTypeProvenance::OpenTypedDictExtraItems
                     } else {
                         InvalidArgumentTypeProvenance::Argument
@@ -4579,7 +4583,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
                     false,
                     true,
                 );
-            } else if tail.is_explicit() {
+            } else if has_explicit_extra_items {
                 let matched_argument = &mut self.argument_matches[argument_index];
                 matched_argument.parameters.push(MatchedParameter {
                     index: parameter_index,
@@ -4589,7 +4593,7 @@ impl<'a, 'db> ArgumentMatcher<'a, 'db> {
             }
         }
 
-        if tail.is_explicit() && !has_keyword_variadic {
+        if has_explicit_extra_items && !has_keyword_variadic {
             self.errors
                 .push(BindingError::UnknownKeywordVariadicArgument {
                     argument_index: self.get_argument_index(argument_index),
