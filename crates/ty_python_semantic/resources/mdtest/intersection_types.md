@@ -672,105 +672,38 @@ def _(
 
 ### Finite indexed protocol constraints
 
-A protocol with a literal `__len__` return type and one indexed `__getitem__` overload per element
-provides finite indexed constraints. Intersecting those constraints with an exact tuple refines each
-element; subtracting a protocol fully described by those constraints produces the remaining tuple
-alternatives. A protocol with additional members remains in the intersection after tuple refinement,
-and its negation remains symbolic. Gradual element types also remain symbolic.
+Tuple simplification only uses synthesized finite indexed protocols, such as those created for exact
+sequence patterns. Class-based protocols remain symbolic. In particular, this prevents method-local
+type variables from escaping their callable binder into a tuple type.
+
+```toml
+[environment]
+python-version = "3.12"
+```
 
 ```py
-from typing import Any
-from typing_extensions import Literal, Protocol, overload
+from typing import Protocol
+from typing_extensions import Literal
 from ty_extensions import Intersection, Not
 
 class PairProtocol(Protocol):
     def __len__(self, /) -> Literal[2]: ...
-    @overload
     def __getitem__(self, index: Literal[0], /) -> int: ...
-    @overload
-    def __getitem__(self, index: Literal[1], /) -> str: ...
 
-class EmptyProtocol(Protocol):
-    def __len__(self, /) -> Literal[0]: ...
-
-class AnyItemProtocol(Protocol):
+class GenericItemProtocol(Protocol):
     def __len__(self, /) -> Literal[1]: ...
-    def __getitem__(self, index: Literal[0], /) -> Any: ...
-
-class ExtendedPairProtocol(PairProtocol, Protocol):
-    def extra(self, /) -> None: ...
-
-class HugeProtocol(Protocol):
-    def __len__(self, /) -> Literal[1_000_000_000]: ...
-    def __getitem__(self, index: Literal[0], /) -> int: ...
-
-class BoolLengthProtocol(Protocol):
-    def __len__(self, /) -> Literal[True]: ...
-    def __getitem__(self, index: Literal[0], /) -> int: ...
-
-class DefaultedIndexProtocol(Protocol):
-    def __len__(self, /) -> Literal[1]: ...
-    def __getitem__(self, index: Literal[0] = 0, /) -> int: ...
+    def __getitem__[T](self, index: Literal[0], /) -> T: ...
 
 def _(
     positive: Intersection[tuple[int | str, int | str], PairProtocol],
-    reversed_positive: Intersection[PairProtocol, tuple[int | str, int | str]],
     negative: Intersection[tuple[int | str, int | str], Not[PairProtocol]],
-    extended: Intersection[tuple[int | str, int | str], ExtendedPairProtocol],
-    reversed_extended: Intersection[ExtendedPairProtocol, tuple[int | str, int | str]],
-    negative_extended: Intersection[tuple[int | str, int | str], Not[ExtendedPairProtocol]],
-    non_tuple_negative: Intersection[list[int], Not[PairProtocol]],
-    huge: Intersection[tuple[int, ...], HugeProtocol],
+    generic_positive: Intersection[tuple[int], GenericItemProtocol],
+    generic_negative: Intersection[tuple[int], Not[GenericItemProtocol]],
 ) -> None:
-    reveal_type(positive)  # revealed: tuple[int, str]
-    reveal_type(reversed_positive)  # revealed: tuple[int, str]
-    reveal_type(negative)  # revealed: tuple[str, int | str] | tuple[int | str, int]
-    reveal_type(extended)  # revealed: tuple[int, str] & ExtendedPairProtocol
-    reveal_type(reversed_extended)  # revealed: ExtendedPairProtocol & tuple[int, str]
-    reveal_type(negative_extended)  # revealed: tuple[int | str, int | str] & ~ExtendedPairProtocol
-    reveal_type(non_tuple_negative)  # revealed: list[int] & ~PairProtocol
-    reveal_type(huge)  # revealed: tuple[int, ...] & HugeProtocol
-
-def _(bool_length: Intersection[tuple[int | str], BoolLengthProtocol]) -> None:
-    reveal_type(bool_length)  # revealed: Never
-
-def _(negative_bool_length: Intersection[tuple[int | str], Not[BoolLengthProtocol]]) -> None:
-    reveal_type(negative_bool_length)  # revealed: tuple[int | str]
-
-def _(defaulted_index: Intersection[tuple[int | str], DefaultedIndexProtocol]) -> None:
-    reveal_type(defaulted_index)  # revealed: tuple[int | str] & DefaultedIndexProtocol
-
-def _(negative_defaulted_index: Intersection[tuple[int | str], Not[DefaultedIndexProtocol]]) -> None:
-    reveal_type(negative_defaulted_index)  # revealed: tuple[int | str] & ~DefaultedIndexProtocol
-
-def _(
-    reversed_negative: Intersection[Not[PairProtocol], tuple[int | str, int | str]],
-    variable_positive: Intersection[tuple[int | str, ...], PairProtocol],
-    variable_negative: Intersection[tuple[int | str, ...], Not[PairProtocol]],
-) -> None:
-    reveal_type(reversed_negative)  # revealed: tuple[str, int | str] | tuple[int | str, int]
-    reveal_type(variable_positive)  # revealed: tuple[int, str]
-    reveal_type(variable_negative)  # revealed: tuple[int | str, ...] & ~PairProtocol
-
-def _(empty_positive: Intersection[tuple[int, ...], EmptyProtocol]) -> None:
-    reveal_type(empty_positive)  # revealed: tuple[()]
-
-def _(empty_negative: Intersection[tuple[()], Not[EmptyProtocol]]) -> None:
-    reveal_type(empty_negative)  # revealed: Never
-
-def _(nonempty_negative: Intersection[tuple[int], Not[EmptyProtocol]]) -> None:
-    reveal_type(nonempty_negative)  # revealed: tuple[int]
-
-def _(
-    dynamic_protocol_positive: Intersection[tuple[int], AnyItemProtocol],
-    dynamic_protocol_negative: Intersection[tuple[int], Not[AnyItemProtocol]],
-    dynamic_tuple_positive: Intersection[tuple[Any, int | str], PairProtocol],
-    dynamic_tuple_negative: Intersection[tuple[Any, int | str], Not[PairProtocol]],
-) -> None:
-    reveal_type(dynamic_protocol_positive)  # revealed: tuple[int] & AnyItemProtocol
-    reveal_type(dynamic_protocol_negative)  # revealed: tuple[int] & ~AnyItemProtocol
-    reveal_type(dynamic_tuple_positive)  # revealed: tuple[Any, int | str] & PairProtocol
-    reveal_type(dynamic_tuple_negative)  # revealed: tuple[Any, int | str] & ~PairProtocol
+    reveal_type(positive)  # revealed: tuple[int | str, int | str] & PairProtocol
+    reveal_type(negative)  # revealed: tuple[int | str, int | str] & ~PairProtocol
+    reveal_type(generic_positive)  # revealed: tuple[int] & GenericItemProtocol
+    reveal_type(generic_negative)  # revealed: tuple[int] & ~GenericItemProtocol
 ```
 
 ### Simplifications of `bool`, `AlwaysTruthy` and `AlwaysFalsy`

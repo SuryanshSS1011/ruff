@@ -1249,7 +1249,6 @@ impl<'db> IntersectionBuilder<'db> {
                             return false;
                         };
                         protocol
-                            .interface(self.db)
                             .finite_indexed_constraint(self.db)
                             .is_some_and(|indexed| indexed.is_entire_interface())
                     })
@@ -1341,9 +1340,7 @@ impl<'db> IntersectionBuilder<'db> {
             }
             _ => {
                 if let Type::ProtocolInstance(protocol) = ty
-                    && let Some(indexed) = protocol
-                        .interface(self.db)
-                        .finite_indexed_constraint(self.db)
+                    && let Some(indexed) = protocol.finite_indexed_constraint(self.db)
                     && indexed.is_entire_interface()
                 {
                     let mut distributed = Vec::new();
@@ -1416,7 +1413,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                 let Type::ProtocolInstance(protocol) = negative else {
                     return None;
                 };
-                let indexed = protocol.interface(db).finite_indexed_constraint(db)?;
+                let indexed = protocol.finite_indexed_constraint(db)?;
                 if !indexed.is_entire_interface() {
                     return None;
                 }
@@ -1641,7 +1638,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     .is_some_and(|instance| instance.has_known_class(db, KnownClass::Bool));
 
                 if let Type::ProtocolInstance(protocol) = new_positive
-                    && let Some(indexed) = protocol.interface(db).finite_indexed_constraint(db)
+                    && let Some(indexed) = protocol.finite_indexed_constraint(db)
                     && let Some((index, refined)) =
                         self.positive
                             .iter()
@@ -1666,7 +1663,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                             let Type::ProtocolInstance(protocol) = existing_positive else {
                                 return None;
                             };
-                            let indexed = protocol.interface(db).finite_indexed_constraint(db)?;
+                            let indexed = protocol.finite_indexed_constraint(db)?;
                             let refined =
                                 refine_tuple_with_indexed_protocol(db, new_positive, &indexed)?;
                             Some((index, indexed, refined))

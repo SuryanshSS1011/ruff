@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use ruff_python_ast::name::Name;
 use ty_module_resolver::{ModuleName, file_to_module};
 
-use super::protocol_class::ProtocolInterface;
+use super::protocol_class::{FiniteIndexedProtocolConstraint, ProtocolInterface};
 use super::{
     BoundTypeVarInstance, ClassType, DivergentType, KnownClass, MaterializationKind,
     SubclassOfType, Type, TypeVarVariance,
@@ -836,6 +836,20 @@ impl<'db> ProtocolInstanceType<'db> {
 
     pub(super) fn interface(self, db: &'db dyn Db) -> ProtocolInterface<'db> {
         self.inner.interface(db)
+    }
+
+    /// Return finite indexed constraints carried by a synthesized protocol.
+    ///
+    /// Class-based protocols can contain callable-local type variables and other constraints that
+    /// cannot safely be represented as tuple element types.
+    pub(super) fn finite_indexed_constraint(
+        self,
+        db: &'db dyn Db,
+    ) -> Option<FiniteIndexedProtocolConstraint<'db>> {
+        if !self.inner.is_synthesized() {
+            return None;
+        }
+        self.interface(db).finite_indexed_constraint(db)
     }
 }
 
