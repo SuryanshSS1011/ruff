@@ -200,6 +200,14 @@ impl<'db> FiniteIndexedProtocolConstraint<'db> {
         &self.element_types
     }
 
+    #[cfg(test)]
+    pub(super) fn from_element_types(element_types: Vec<Type<'db>>) -> Self {
+        Self {
+            element_types: element_types.into_boxed_slice(),
+            is_entire_interface: true,
+        }
+    }
+
     /// Return `true` if the indexed facts account for every member in the protocol interface.
     pub(super) fn is_entire_interface(&self) -> bool {
         self.is_entire_interface

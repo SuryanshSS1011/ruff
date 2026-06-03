@@ -102,6 +102,12 @@ fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
         .all(|element| !any_over_type(db, *element, true, |ty| ty.is_dynamic()))
 }
 
+/// Avoid expanding large indexed-protocol complements into an expensive union of tuple types.
+///
+/// TODO: Represent these complements compactly so that larger exact patterns can also be
+/// simplified.
+const MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES: usize = 64;
+
 /// Refine a concrete tuple instance using finite indexed constraints from a protocol.
 ///
 /// Returns `None` when `ty` is not an exact tuple instance, `Some(Never)` when the tuple shape is
@@ -163,7 +169,8 @@ fn subtract_indexed_protocol_from_tuple<'db>(
         return Some(vec![ty]);
     }
 
-    let mut alternatives = Vec::new();
+    let mut remaining_elements = Vec::new();
+    let mut exceeds_alternative_limit = false;
 
     for (index, (element, protocol_element)) in tuple
         .all_elements()
@@ -179,6 +186,10 @@ fn subtract_indexed_protocol_from_tuple<'db>(
             continue;
         }
 
+        if exceeds_alternative_limit {
+            continue;
+        }
+
         let remaining_element = IntersectionBuilder::new(db)
             .add_positive(*element)
             .add_negative(*protocol_element)
@@ -188,10 +199,27 @@ fn subtract_indexed_protocol_from_tuple<'db>(
             continue;
         }
 
-        let mut elements = tuple.all_elements().to_vec();
-        elements[index] = remaining_element;
-        alternatives.push(Type::tuple(TupleType::heterogeneous(db, elements)));
+        if remaining_elements.len() == MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES {
+            remaining_elements.clear();
+            exceeds_alternative_limit = true;
+            continue;
+        }
+
+        remaining_elements.push((index, remaining_element));
     }
+
+    if exceeds_alternative_limit {
+        return None;
+    }
+
+    let alternatives = remaining_elements
+        .into_iter()
+        .map(|(index, remaining_element)| {
+            let mut elements = tuple.all_elements().to_vec();
+            elements[index] = remaining_element;
+            Type::tuple(TupleType::heterogeneous(db, elements))
+        })
+        .collect();
 
     Some(alternatives)
 }
@@ -2035,12 +2063,15 @@ impl<'db> InnerIntersectionBuilder<'db> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IntersectionBuilder, MAX_NON_RECURSIVE_UNION_LITERALS, Type, UnionBuilder, UnionType,
+        IntersectionBuilder, MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+        MAX_NON_RECURSIVE_UNION_LITERALS, Type, UnionBuilder, UnionType,
+        subtract_indexed_protocol_from_tuple,
     };
 
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::{global_symbol, known_module_symbol};
     use crate::types::enums::enum_member_literals;
+    use crate::types::protocol_class::FiniteIndexedProtocolConstraint;
     use crate::types::type_alias::TypeAliasType;
     use crate::types::{KnownClass, KnownInstanceType, Truthiness};
 
@@ -2137,6 +2168,21 @@ mod tests {
 
         let intersection = IntersectionBuilder::new(&db).build();
         assert_eq!(intersection, Type::object());
+    }
+
+    #[test]
+    fn large_indexed_protocol_complement_remains_symbolic() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let element = UnionType::from_two_elements(&db, int, KnownClass::Str.to_instance(&db));
+        let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES + 1;
+        let tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        let protocol = FiniteIndexedProtocolConstraint::from_element_types(vec![int; length]);
+
+        assert_eq!(
+            subtract_indexed_protocol_from_tuple(&db, tuple, &protocol),
+            None
+        );
     }
 
     #[test]
