@@ -341,9 +341,6 @@ impl<'db> CallableSignature<'db> {
                                         })
                                         .chain(signature.parameters().iter().cloned()),
                                 )
-                                .with_hidden_open_typed_dict_tail(
-                                    signature.parameters().has_hidden_open_typed_dict_tail,
-                                )
                             },
                             return_ty: self_signature.return_ty.apply_type_mapping_impl(
                                 db,
@@ -771,7 +768,6 @@ impl<'db> Signature<'db> {
                     .zip(previous.parameters.iter())
                     .map(|(curr, prev)| curr.cycle_normalized(db, prev, cycle)),
             )
-            .with_hidden_open_typed_dict_tail(self.parameters.has_hidden_open_typed_dict_tail)
         } else {
             debug_assert_eq!(previous.parameters, Parameters::bottom());
             self.parameters.clone()
@@ -805,7 +801,6 @@ impl<'db> Signature<'db> {
                 parameters.push(param.recursive_type_normalized_impl(db, div, nested)?);
             }
             Parameters::new(db, parameters)
-                .with_hidden_open_typed_dict_tail(self.parameters.has_hidden_open_typed_dict_tail)
         };
         Some(Self {
             generic_context: self.generic_context,
@@ -929,8 +924,7 @@ impl<'db> Signature<'db> {
             parameters.next();
         }
 
-        let mut parameters = Parameters::new(db, parameters)
-            .with_hidden_open_typed_dict_tail(self.parameters.has_hidden_open_typed_dict_tail);
+        let mut parameters = Parameters::new(db, parameters);
         let mut return_ty = self.return_ty;
         let binding_context = self.definition.map(BindingContext::Definition);
         if let Some(self_type) = self_type
@@ -1120,11 +1114,7 @@ impl<'db> Signature<'db> {
 
         // Expand `P.args`/`P.kwargs` while the pair is still adjacent. The keyword-only reshuffle
         // below can separate them, which would otherwise prevent expansion.
-        let remaining = Parameters::new(db, remaining)
-            .with_hidden_open_typed_dict_tail(
-                signature.parameters().has_hidden_open_typed_dict_tail,
-            )
-            .expand_paramspec_variadics(db);
+        let remaining = Parameters::new(db, remaining).expand_paramspec_variadics(db);
 
         let mut reordered = Vec::with_capacity(remaining.len());
         let mut keyword_only = Vec::new();
@@ -1152,10 +1142,7 @@ impl<'db> Signature<'db> {
         reordered.extend(keyword_variadic);
 
         signature
-            .with_parameters(
-                Parameters::new(db, reordered)
-                    .with_hidden_open_typed_dict_tail(remaining.has_hidden_open_typed_dict_tail),
-            )
+            .with_parameters(Parameters::new(db, reordered))
             .with_return_type(return_ty)
     }
 
@@ -2317,10 +2304,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         db,
                         CallableSignature::single(Signature::new_generic(
                             source.generic_context,
-                            Parameters::new(db, source_params.cloned())
-                                .with_hidden_open_typed_dict_tail(
-                                    source.parameters.has_hidden_open_typed_dict_tail,
-                                ),
+                            Parameters::new(db, source_params.cloned()),
                             Type::unknown(),
                         )),
                         CallableTypeKind::ParamSpecValue,
@@ -2453,10 +2437,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                         db,
                         CallableSignature::single(Signature::new_generic(
                             target.generic_context,
-                            Parameters::new(db, target_params.cloned())
-                                .with_hidden_open_typed_dict_tail(
-                                    target.parameters.has_hidden_open_typed_dict_tail,
-                                ),
+                            Parameters::new(db, target_params.cloned()),
                             Type::unknown(),
                         )),
                         CallableTypeKind::ParamSpecValue,
@@ -2710,13 +2691,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // parameter which means that the keyword variant is still unmatched.
         let mut target_keywords = Vec::new();
         let mut target_index = 0usize;
-
-        if target.parameters.has_hidden_open_typed_dict_tail
-            && !source.parameters.has_hidden_open_typed_dict_tail
-            && !source.parameters.iter().any(Parameter::is_keyword_variadic)
-        {
-            return self.never();
-        }
 
         loop {
             let Some(next_parameter) = parameters.next() else {
@@ -3122,7 +3096,7 @@ pub(crate) enum ParametersKind<'db> {
 /// proper. For example, even if this represents a `Gradual` form, the `value` field should still
 /// contain the `*args: Any` and `**kwargs: Any` parameter. A `**kwargs: Unpack[TypedDict]`
 /// parameter is normalized to the keyword-only parameters exposed to callers plus a possible
-/// trailing `**kwargs` parameter for explicit extra items.
+/// trailing `**kwargs` parameter for explicit extra items or an open `TypedDict`.
 ///
 /// The `kind` field is used to indicate the specific form of the parameter list which can,
 /// optionally, include additional information such as the bound `ParamSpec` type variable.
@@ -3134,11 +3108,6 @@ pub(crate) struct Parameters<'db> {
     // TODO: use SmallVec here once invariance bug is fixed
     value: Vec<Parameter<'db>>,
     kind: ParametersKind<'db>,
-    /// Whether this parameter list came from `**kwargs: Unpack[OpenTypedDict]`.
-    ///
-    /// Open `TypedDict`s do not expose arbitrary keywords to direct calls, but hidden items still
-    /// need to participate when the unpacked signature is the target of a callable relation.
-    has_hidden_open_typed_dict_tail: bool,
 }
 
 impl<'db> Parameters<'db> {
@@ -3148,19 +3117,17 @@ impl<'db> Parameters<'db> {
     /// if the parameter list contains `*args` and `**kwargs`, then it checks their annotated types
     /// and the presence of other parameter kinds to determine if they represent a gradual form, a
     /// `ParamSpec`, or a `Concatenate` form. `**kwargs: Unpack[TypedDict]` is normalized here by
-    /// synthesizing keyword-only parameters for the unpacked keys and a trailing `**kwargs`
-    /// parameter for explicit extra items.
+    /// synthesizing keyword-only parameters for the unpacked keys and a possible trailing
+    /// `**kwargs` parameter for explicit extra items or an open `TypedDict`.
     pub(crate) fn new(
         db: &'db dyn Db,
         parameters: impl IntoIterator<Item = Parameter<'db>>,
     ) -> Self {
         let parameters = parameters.into_iter();
         let mut value: Vec<Parameter<'db>> = Vec::with_capacity(parameters.size_hint().0);
-        let mut has_hidden_open_typed_dict_tail = false;
 
         for parameter in parameters {
             if let Some(unpacked_typed_dict) = parameter.unpacked_typed_dict(db) {
-                has_hidden_open_typed_dict_tail |= unpacked_typed_dict.openness(db).is_open();
                 let unpacked_keys = parameter
                     .unpacked_typed_dict_keys(db)
                     .expect("a TypedDict should expose unpacked keys");
@@ -3187,7 +3154,7 @@ impl<'db> Parameters<'db> {
                     );
                 }
 
-                if let Some(extra_items) = unpacked_typed_dict.explicit_extra_items(db) {
+                if let Some(extra_items) = unpacked_typed_dict.effective_extra_items(db) {
                     value.push(
                         Parameter::keyword_variadic(kwargs_name)
                             .with_annotated_type(extra_items.declared_ty),
@@ -3275,11 +3242,7 @@ impl<'db> Parameters<'db> {
 
         value.shrink_to_fit();
 
-        Parameters {
-            value,
-            kind,
-            has_hidden_open_typed_dict_tail,
-        }
+        Parameters { value, kind }
     }
 
     /// Create an empty parameter list.
@@ -3287,7 +3250,6 @@ impl<'db> Parameters<'db> {
         Self {
             value: Vec::new(),
             kind: ParametersKind::Standard,
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3358,7 +3320,6 @@ impl<'db> Parameters<'db> {
                     .with_annotated_type(todo_type!("todo signature **kwargs")),
             ],
             kind: ParametersKind::Gradual,
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3376,7 +3337,6 @@ impl<'db> Parameters<'db> {
                     .with_annotated_type(Type::Dynamic(DynamicType::Any)),
             ],
             kind: ParametersKind::Gradual,
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3391,7 +3351,6 @@ impl<'db> Parameters<'db> {
                 ),
             ],
             kind: ParametersKind::ParamSpec(typevar),
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3421,7 +3380,6 @@ impl<'db> Parameters<'db> {
         Self {
             value: prefix_params,
             kind: ParametersKind::Concatenate(concatenate_tail),
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3440,7 +3398,6 @@ impl<'db> Parameters<'db> {
                     .with_annotated_type(Type::Dynamic(DynamicType::Unknown)),
             ],
             kind: ParametersKind::Gradual,
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3454,7 +3411,6 @@ impl<'db> Parameters<'db> {
                     .with_annotated_type(Type::object()),
             ],
             kind: ParametersKind::Standard,
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3474,7 +3430,6 @@ impl<'db> Parameters<'db> {
                     .with_annotated_type(Type::object()),
             ],
             kind: ParametersKind::Top,
-            has_hidden_open_typed_dict_tail: false,
         }
     }
 
@@ -3629,13 +3584,7 @@ impl<'db> Parameters<'db> {
                 .map(|param| param.apply_type_mapping_impl(db, &type_mapping, tcx, visitor))
                 .collect(),
             kind: self.kind,
-            has_hidden_open_typed_dict_tail: self.has_hidden_open_typed_dict_tail,
         }
-    }
-
-    fn with_hidden_open_typed_dict_tail(mut self, has_hidden_tail: bool) -> Self {
-        self.has_hidden_open_typed_dict_tail |= has_hidden_tail;
-        self
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -3759,12 +3708,6 @@ impl<'db> Parameters<'db> {
         expanded.extend_from_slice(mapped_signature.parameters().as_slice());
         expanded.extend_from_slice(&self.value[variadic_index + 2..]);
         Parameters::new(db, expanded)
-            .with_hidden_open_typed_dict_tail(self.has_hidden_open_typed_dict_tail)
-            .with_hidden_open_typed_dict_tail(
-                mapped_signature
-                    .parameters()
-                    .has_hidden_open_typed_dict_tail,
-            )
     }
 }
 
