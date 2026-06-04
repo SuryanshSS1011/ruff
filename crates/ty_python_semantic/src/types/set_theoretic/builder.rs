@@ -101,6 +101,21 @@ fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
         .all(|element| !any_over_type(db, *element, true, |ty| ty.is_dynamic()))
 }
 
+/// Limit the total number of intersection alternatives produced by tuple protocol complements.
+const MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES: usize = 128;
+
+fn consume_indexed_protocol_expansion_budget(
+    alternatives: usize,
+    remaining_budget: &mut usize,
+) -> bool {
+    let additional_alternatives = alternatives.saturating_sub(1);
+    if additional_alternatives > *remaining_budget {
+        return false;
+    }
+    *remaining_budget -= additional_alternatives;
+    true
+}
+
 /// Refine a tuple specialization using finite indexed constraints from a protocol.
 ///
 /// Returns `None` when `ty` is not a tuple specialization, `Some(Never)` when the tuple shape is
@@ -136,6 +151,71 @@ fn refine_tuple_with_indexed_protocol<'db>(
     };
 
     Some(Type::tuple(TupleType::new(db, &refined.build())))
+}
+
+/// Subtract finite indexed constraints from a fixed-length tuple type.
+///
+/// The returned alternatives are the remaining tuple shapes. An empty vector means the tuple was
+/// fully covered by the protocol; `None` means `ty` is not an exact fixed tuple and the caller
+/// should use a less precise fallback.
+fn subtract_indexed_protocol_from_tuple<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    protocol_elements: &[Type<'db>],
+) -> Option<Vec<Type<'db>>> {
+    if !all_elements_are_static(db, protocol_elements) {
+        return None;
+    }
+
+    let Type::NominalInstance(instance) = ty else {
+        return None;
+    };
+    let tuple = instance.own_tuple_spec(db)?;
+    let TupleSpec::Fixed(tuple) = tuple.as_ref() else {
+        return None;
+    };
+    if !all_elements_are_static(db, tuple.all_elements()) {
+        return None;
+    }
+
+    if tuple.len() != protocol_elements.len() {
+        return Some(vec![ty]);
+    }
+
+    let mut remaining_elements = Vec::new();
+    for (index, (element, protocol_element)) in tuple
+        .all_elements()
+        .iter()
+        .zip(protocol_elements)
+        .enumerate()
+    {
+        if element.is_disjoint_from(db, *protocol_element) {
+            return Some(vec![ty]);
+        }
+        if element.is_subtype_of(db, *protocol_element) {
+            continue;
+        }
+
+        let remaining_element = IntersectionBuilder::new(db)
+            .add_positive(*element)
+            .add_negative(*protocol_element)
+            .build();
+        if remaining_element.is_never() {
+            continue;
+        }
+        remaining_elements.push((index, remaining_element));
+    }
+
+    Some(
+        remaining_elements
+            .into_iter()
+            .map(|(index, remaining_element)| {
+                let mut elements = tuple.all_elements().to_vec();
+                elements[index] = remaining_element;
+                Type::heterogeneous_tuple(db, elements)
+            })
+            .collect(),
+    )
 }
 
 /// Try to merge a complementary guarded pair into an unguarded core.
@@ -1191,9 +1271,33 @@ impl<'db> IntersectionBuilder<'db> {
             _ => {
                 // If we are already a union-of-intersections, distribute the new intersected element
                 // across all of those intersections.
-                for inner in &mut self.intersections {
-                    inner.add_positive(self.db, ty);
+                if !self.intersections.iter().any(|inner| {
+                    inner.negative.iter().any(|negative| {
+                        let Type::ProtocolInstance(protocol) = negative else {
+                            return false;
+                        };
+                        protocol.finite_indexed_constraint(self.db).is_some()
+                    })
+                }) {
+                    for inner in &mut self.intersections {
+                        inner.add_positive(self.db, ty);
+                    }
+                    return self;
                 }
+
+                let mut remaining_budget = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+                    .saturating_sub(self.intersections.len());
+                self.intersections = self
+                    .intersections
+                    .into_iter()
+                    .flat_map(|inner| {
+                        inner.add_positive_distributing_indexed_protocol_negatives(
+                            self.db,
+                            ty,
+                            &mut remaining_budget,
+                        )
+                    })
+                    .collect();
                 self
             }
         }
@@ -1267,6 +1371,32 @@ impl<'db> IntersectionBuilder<'db> {
                 self.add_negative_impl(complement.to_intersection(db), seen_aliases)
             }
             _ => {
+                if let Type::ProtocolInstance(protocol) = ty
+                    && let Some(indexed) = protocol.finite_indexed_constraint(self.db)
+                {
+                    let mut remaining_budget = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+                        .saturating_sub(self.intersections.len());
+                    let mut distributed = Vec::new();
+
+                    for mut inner in self.intersections {
+                        if let Some(alternatives) =
+                            inner.subtract_indexed_protocol(self.db, &indexed)
+                            && consume_indexed_protocol_expansion_budget(
+                                alternatives.len(),
+                                &mut remaining_budget,
+                            )
+                        {
+                            distributed.extend(alternatives);
+                        } else {
+                            inner.add_negative(self.db, ty);
+                            distributed.push(inner);
+                        }
+                    }
+
+                    self.intersections = distributed;
+                    return self;
+                }
+
                 for inner in &mut self.intersections {
                     inner.add_negative(self.db, ty);
                 }
@@ -1303,6 +1433,75 @@ struct InnerIntersectionBuilder<'db> {
 }
 
 impl<'db> InnerIntersectionBuilder<'db> {
+    /// Add a positive type, then distribute any finite indexed protocol complements that constrain
+    /// the resulting positives.
+    fn add_positive_distributing_indexed_protocol_negatives(
+        mut self,
+        db: &'db dyn Db,
+        new_positive: Type<'db>,
+        remaining_budget: &mut usize,
+    ) -> Vec<Self> {
+        self.add_positive(db, new_positive);
+        self.distribute_indexed_protocol_negatives(db, remaining_budget)
+    }
+
+    fn distribute_indexed_protocol_negatives(
+        self,
+        db: &'db dyn Db,
+        remaining_budget: &mut usize,
+    ) -> Vec<Self> {
+        let applicable_negative = self.negative.iter().find_map(|negative| {
+            let Type::ProtocolInstance(protocol) = negative else {
+                return None;
+            };
+            let indexed = protocol.finite_indexed_constraint(db)?;
+            self.subtract_indexed_protocol(db, &indexed)
+                .map(|alternatives| (*negative, alternatives))
+        });
+
+        let Some((negative, alternatives)) = applicable_negative else {
+            return vec![self];
+        };
+
+        if !consume_indexed_protocol_expansion_budget(alternatives.len(), remaining_budget) {
+            return vec![self];
+        }
+
+        alternatives
+            .into_iter()
+            .flat_map(|mut alternative| {
+                alternative.negative.swap_remove(&negative);
+                alternative.distribute_indexed_protocol_negatives(db, remaining_budget)
+            })
+            .collect()
+    }
+
+    fn subtract_indexed_protocol(
+        &self,
+        db: &'db dyn Db,
+        protocol_elements: &[Type<'db>],
+    ) -> Option<Vec<Self>> {
+        for (index, existing_positive) in self.positive.iter().enumerate() {
+            let Some(remaining_types) =
+                subtract_indexed_protocol_from_tuple(db, *existing_positive, protocol_elements)
+            else {
+                continue;
+            };
+
+            let mut alternatives = Vec::with_capacity(remaining_types.len());
+            for remaining in remaining_types {
+                let mut alternative = self.clone();
+                alternative.positive.swap_remove_index(index);
+                alternative.add_positive(db, remaining);
+                if !alternative.positive.contains(&Type::Never) {
+                    alternatives.push(alternative);
+                }
+            }
+            return Some(alternatives);
+        }
+        None
+    }
+
     /// Return `true` when an intersection excludes every member of an enum class.
     ///
     /// This recognizes enum complements that have become empty, such as
@@ -1858,12 +2057,15 @@ impl<'db> InnerIntersectionBuilder<'db> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IntersectionBuilder, MAX_NON_RECURSIVE_UNION_LITERALS, Type, UnionBuilder, UnionType,
+        IntersectionBuilder, MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+        MAX_NON_RECURSIVE_UNION_LITERALS, Type, UnionBuilder, UnionType,
+        subtract_indexed_protocol_from_tuple,
     };
 
     use crate::db::tests::{TestDb, setup_db};
     use crate::place::{global_symbol, known_module_symbol};
     use crate::types::enums::enum_member_literals;
+    use crate::types::match_pattern::exact_sequence_pattern_type;
     use crate::types::type_alias::TypeAliasType;
     use crate::types::{KnownClass, KnownInstanceType, Truthiness};
 
@@ -1896,6 +2098,51 @@ mod tests {
         let union = UnionType::from_elements(&db, [t0, t1]).expect_union();
 
         assert_eq!(union.elements(&db), &[t0, t1]);
+    }
+
+    #[test]
+    fn tuple_protocol_complement_expands_to_union() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let element = UnionType::from_two_elements(&db, int, str);
+        let tuple = Type::heterogeneous_tuple(&db, [element, element]);
+
+        assert_eq!(
+            subtract_indexed_protocol_from_tuple(&db, tuple, &[int, str]),
+            Some(vec![
+                Type::heterogeneous_tuple(&db, [str, element]),
+                Type::heterogeneous_tuple(&db, [element, int]),
+            ])
+        );
+    }
+
+    #[test]
+    fn tuple_protocol_complement_expansion_is_bounded() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let element = UnionType::from_two_elements(&db, int, str);
+        let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES + 1;
+        let tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        let pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
+        let Type::Intersection(pattern) = pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let protocol = *pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+
+        let result = IntersectionBuilder::new(&db)
+            .add_positive(tuple)
+            .add_negative(protocol)
+            .build();
+        let Type::Intersection(result) = result else {
+            panic!("Expected complement beyond the limit to remain symbolic");
+        };
+        assert!(result.negative(&db).contains(&protocol));
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
