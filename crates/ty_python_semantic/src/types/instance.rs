@@ -25,6 +25,7 @@ use crate::types::relation::{
 };
 use crate::types::signatures::SignatureRelationVisitor;
 use crate::types::tuple::{TupleSpec, TupleType, walk_tuple_type};
+use crate::types::visitor::any_over_type;
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ErrorContext,
     FindLegacyTypeVarsVisitor, LiteralValueTypeKind, TypeContext, TypeMapping, VarianceInferable,
@@ -838,15 +839,23 @@ impl<'db> ProtocolInstanceType<'db> {
         self.inner.interface(db)
     }
 
-    /// Return finite indexed constraints carried by a synthesized protocol.
+    /// Return finite indexed constraints that can safely be represented as tuple element types.
     ///
-    /// Class-based protocols can contain callable-local type variables and other constraints that
-    /// cannot safely be represented as tuple element types.
+    /// Class-based protocols can contain callable-local or unspecialized class type variables.
+    /// Keep those protocols symbolic so that the type variables do not escape their binders.
     pub(super) fn finite_indexed_constraint(self, db: &'db dyn Db) -> Option<Box<[Type<'db>]>> {
-        let Protocol::Synthesized(protocol) = self.inner else {
-            return None;
-        };
-        protocol.interface().finite_indexed_constraint(db)
+        let constraint = self.interface(db).finite_indexed_constraint(db)?;
+        match self.inner {
+            Protocol::Synthesized(_) => Some(constraint),
+            Protocol::FromClass(_)
+                if constraint.iter().all(|element| {
+                    !any_over_type(db, *element, true, |ty| matches!(ty, Type::TypeVar(_)))
+                }) =>
+            {
+                Some(constraint)
+            }
+            Protocol::FromClass(_) => None,
+        }
     }
 }
 

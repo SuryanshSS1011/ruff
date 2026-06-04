@@ -672,9 +672,13 @@ def _(
 
 ### Finite indexed protocol constraints
 
-Tuple simplification only uses synthesized finite indexed protocols, such as those created for exact
-sequence patterns. Class-based protocols remain symbolic. In particular, this prevents method-local
-type variables from escaping their callable binder into a tuple type.
+Protocols with a literal `__len__` return type and one indexed `__getitem__` overload per element
+provide finite indexed constraints. Intersecting those constraints with an exact tuple refines each
+element.
+
+The element constraints must not contain type variables. This prevents method-local or unspecialized
+class type variables from escaping their binders into a tuple type. Protocols with additional
+members also remain symbolic because the indexed constraints do not describe their entire interface.
 
 ```toml
 [environment]
@@ -682,28 +686,57 @@ python-version = "3.12"
 ```
 
 ```py
-from typing import Protocol
+from typing import Protocol, overload
 from typing_extensions import Literal
 from ty_extensions import Intersection, Not
 
-class PairProtocol(Protocol):
+class ObjectStrPair(Protocol):
     def __len__(self, /) -> Literal[2]: ...
-    def __getitem__(self, index: Literal[0], /) -> int: ...
+    @overload
+    def __getitem__(self, index: Literal[0], /) -> object: ...
+    @overload
+    def __getitem__(self, index: Literal[1], /) -> str: ...
+
+class ExtendedObjectStrPair(ObjectStrPair, Protocol):
+    def extra(self, /) -> None: ...
 
 class GenericItemProtocol(Protocol):
     def __len__(self, /) -> Literal[1]: ...
     def __getitem__[T](self, index: Literal[0], /) -> T: ...
 
+type Identity[T] = T
+
+class AliasedGenericItemProtocol(Protocol):
+    def __len__(self, /) -> Literal[1]: ...
+    def __getitem__[T](self, index: Literal[0], /) -> Identity[T]: ...
+
+class GenericPair[T](Protocol):
+    def __len__(self, /) -> Literal[2]: ...
+    @overload
+    def __getitem__(self, index: Literal[0], /) -> T: ...
+    @overload
+    def __getitem__(self, index: Literal[1], /) -> str: ...
+
 def _(
-    positive: Intersection[tuple[int | str, int | str], PairProtocol],
-    negative: Intersection[tuple[int | str, int | str], Not[PairProtocol]],
+    positive: Intersection[tuple[int | str, int | str], ObjectStrPair],
+    reversed_positive: Intersection[ObjectStrPair, tuple[int | str, int | str]],
+    negative: Intersection[tuple[int | str, int | str], Not[ObjectStrPair]],
+    extended: Intersection[tuple[int | str, int | str], ExtendedObjectStrPair],
+    specialized_generic: Intersection[tuple[int | str, int | str], GenericPair[int]],
+    unspecialized_generic: Intersection[tuple[int | str, int | str], GenericPair],
     generic_positive: Intersection[tuple[int], GenericItemProtocol],
     generic_negative: Intersection[tuple[int], Not[GenericItemProtocol]],
+    aliased_generic_positive: Intersection[tuple[int], AliasedGenericItemProtocol],
 ) -> None:
-    reveal_type(positive)  # revealed: tuple[int | str, int | str] & PairProtocol
-    reveal_type(negative)  # revealed: tuple[int | str, int | str] & ~PairProtocol
+    reveal_type(positive)  # revealed: tuple[int | str, str]
+    reveal_type(reversed_positive)  # revealed: tuple[int | str, str]
+    reveal_type(negative)  # revealed: tuple[int | str, int | str] & ~ObjectStrPair
+    reveal_type(extended)  # revealed: tuple[int | str, int | str] & ExtendedObjectStrPair
+    reveal_type(specialized_generic)  # revealed: tuple[int, str]
+    reveal_type(unspecialized_generic)  # revealed: tuple[int | str, int | str] & GenericPair[Unknown]
     reveal_type(generic_positive)  # revealed: tuple[int] & GenericItemProtocol
     reveal_type(generic_negative)  # revealed: tuple[int] & ~GenericItemProtocol
+    reveal_type(aliased_generic_positive)  # revealed: tuple[int] & AliasedGenericItemProtocol
 ```
 
 ### Simplifications of `bool`, `AlwaysTruthy` and `AlwaysFalsy`
