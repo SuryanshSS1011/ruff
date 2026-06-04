@@ -146,12 +146,20 @@ impl InnerIndexedProtocolComplementPlan<'_> {
             Self::Alternatives { tuple_changes, .. } => tuple_changes.len(),
         }
     }
+
+    fn materialization_count(&self) -> usize {
+        match self {
+            Self::Unchanged | Self::Eliminated => 0,
+            Self::Alternatives { tuple_changes, .. } => tuple_changes.len(),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct IndexedProtocolExpansionPlan<'db> {
     protocol: Type<'db>,
     alternatives: usize,
+    materializations: usize,
     branches: Vec<Option<InnerIndexedProtocolComplementPlan<'db>>>,
 }
 
@@ -1507,6 +1515,7 @@ impl<'db> IntersectionBuilder<'db> {
         &mut self,
         mut protocols: FxOrderSet<Type<'db>>,
     ) -> Result<(), ()> {
+        let mut remaining_materializations = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES;
         while !protocols.is_empty() {
             // Apply shrinking complements first so they can remove branches before an expansive
             // complement consumes the materialization limit.
@@ -1525,6 +1534,9 @@ impl<'db> IntersectionBuilder<'db> {
             if plan.alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES {
                 return Err(());
             }
+            remaining_materializations = remaining_materializations
+                .checked_sub(plan.materializations)
+                .ok_or(())?;
             let protocol = plan.protocol;
             protocols.swap_remove(&protocol);
 
@@ -1555,6 +1567,7 @@ impl<'db> IntersectionBuilder<'db> {
             return Ok(IndexedProtocolExpansionPlan {
                 protocol,
                 alternatives: self.intersections.len(),
+                materializations: 0,
                 branches: vec![None; self.intersections.len()],
             });
         };
@@ -1562,11 +1575,13 @@ impl<'db> IntersectionBuilder<'db> {
             return Ok(IndexedProtocolExpansionPlan {
                 protocol,
                 alternatives: self.intersections.len(),
+                materializations: 0,
                 branches: vec![None; self.intersections.len()],
             });
         };
 
         let mut total_alternatives = 0usize;
+        let mut total_materializations = 0usize;
         let mut branches = Vec::with_capacity(self.intersections.len());
         for inner in &self.intersections {
             if inner.positive.contains(&Type::Never) {
@@ -1588,12 +1603,17 @@ impl<'db> IntersectionBuilder<'db> {
             let alternatives = plan
                 .as_ref()
                 .map_or(1, InnerIndexedProtocolComplementPlan::alternative_count);
+            let materializations = plan
+                .as_ref()
+                .map_or(0, InnerIndexedProtocolComplementPlan::materialization_count);
             total_alternatives = total_alternatives.saturating_add(alternatives);
+            total_materializations = total_materializations.saturating_add(materializations);
             branches.push(plan);
         }
         Ok(IndexedProtocolExpansionPlan {
             protocol,
             alternatives: total_alternatives,
+            materializations: total_materializations,
             branches,
         })
     }
@@ -2632,6 +2652,73 @@ mod tests {
                 "Tuple complement materialization exceeded the configured limit"
             );
         });
+    }
+
+    #[test]
+    fn tuple_protocol_complement_materialization_budget_is_cumulative() {
+        fn protocol_for<'db>(db: &'db TestDb, elements: &[Type<'db>]) -> Type<'db> {
+            let pattern = exact_sequence_pattern_type(db, elements);
+            let Type::Intersection(pattern) = pattern else {
+                panic!("Expected exact sequence pattern to be an intersection");
+            };
+            *pattern
+                .positive(db)
+                .iter()
+                .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+                .expect("Expected exact sequence pattern to contain a protocol")
+        }
+
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let bytes = KnownClass::Bytes.to_instance(&db);
+        let int_or_str = UnionType::from_two_elements(&db, int, str);
+        let trailing = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES;
+        let first_tuple = Type::heterogeneous_tuple(
+            &db,
+            [int_or_str, int_or_str]
+                .into_iter()
+                .chain(std::iter::repeat_n(int, trailing)),
+        );
+        let second_tuple = Type::heterogeneous_tuple(
+            &db,
+            [UnionType::from_two_elements(&db, int, bytes), str]
+                .into_iter()
+                .chain(std::iter::repeat_n(int_or_str, trailing)),
+        );
+        let first_protocol = protocol_for(
+            &db,
+            &std::iter::once(str)
+                .chain(std::iter::repeat_n(Type::object(), trailing + 1))
+                .collect::<Vec<_>>(),
+        );
+        let second_protocol = protocol_for(
+            &db,
+            &[Type::object(), str]
+                .into_iter()
+                .chain(std::iter::repeat_n(int, trailing))
+                .collect::<Vec<_>>(),
+        );
+
+        for [first, second] in [
+            [first_protocol, second_protocol],
+            [second_protocol, first_protocol],
+        ] {
+            super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
+                .with(|materializations| materializations.set(0));
+            IntersectionBuilder::new(&db)
+                .add_positive(first_tuple)
+                .add_positive(second_tuple)
+                .add_negative(first)
+                .add_negative(second)
+                .build();
+            super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
+                assert!(
+                    materializations.get() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+                    "Tuple complement materialization exceeded the cumulative limit"
+                );
+            });
+        }
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
