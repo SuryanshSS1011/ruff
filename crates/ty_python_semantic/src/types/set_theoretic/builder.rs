@@ -117,10 +117,11 @@ fn consume_indexed_protocol_expansion_budget(
 }
 
 #[derive(Debug, Eq, PartialEq)]
-enum TupleProtocolComplement<'db> {
+enum TupleProtocolComplement<T> {
     NotApplicable,
     ExceedsLimit,
-    Alternatives(Vec<Type<'db>>),
+    Unchanged,
+    Alternatives(T),
 }
 
 /// Refine a tuple specialization using finite indexed constraints from a protocol.
@@ -160,17 +161,16 @@ fn refine_tuple_with_indexed_protocol<'db>(
     Some(Type::tuple(TupleType::new(db, &refined.build())))
 }
 
-/// Subtract finite indexed constraints from a fixed-length tuple type.
+/// Plan subtraction of finite indexed constraints from a fixed-length tuple type.
 ///
-/// The returned alternatives are the remaining tuple shapes. An empty vector means the tuple was
-/// fully covered by the protocol; `None` means `ty` is not an exact fixed tuple and the caller
-/// should use a less precise fallback.
-fn subtract_indexed_protocol_from_tuple<'db>(
+/// The plan records only the tuple positions that differ in each alternative. This lets callers
+/// count alternatives without constructing complete tuple types.
+fn plan_indexed_protocol_complement<'db>(
     db: &'db dyn Db,
     ty: Type<'db>,
     protocol_elements: &[Type<'db>],
     max_alternatives: usize,
-) -> TupleProtocolComplement<'db> {
+) -> TupleProtocolComplement<Vec<(usize, Type<'db>)>> {
     if !all_elements_are_static(db, protocol_elements) {
         return TupleProtocolComplement::NotApplicable;
     }
@@ -189,7 +189,7 @@ fn subtract_indexed_protocol_from_tuple<'db>(
     }
 
     if tuple.len() != protocol_elements.len() {
-        return TupleProtocolComplement::Alternatives(vec![ty]);
+        return TupleProtocolComplement::Unchanged;
     }
 
     let mut remaining_elements = Vec::new();
@@ -200,7 +200,7 @@ fn subtract_indexed_protocol_from_tuple<'db>(
         .enumerate()
     {
         if element.is_disjoint_from(db, *protocol_element) {
-            return TupleProtocolComplement::Alternatives(vec![ty]);
+            return TupleProtocolComplement::Unchanged;
         }
         if element.is_subtype_of(db, *protocol_element) {
             continue;
@@ -219,16 +219,38 @@ fn subtract_indexed_protocol_from_tuple<'db>(
         remaining_elements.push((index, remaining_element));
     }
 
-    TupleProtocolComplement::Alternatives(
-        remaining_elements
-            .into_iter()
-            .map(|(index, remaining_element)| {
-                let mut elements = tuple.all_elements().to_vec();
-                elements[index] = remaining_element;
-                Type::heterogeneous_tuple(db, elements)
-            })
-            .collect(),
-    )
+    TupleProtocolComplement::Alternatives(remaining_elements)
+}
+
+fn subtract_indexed_protocol_from_tuple<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    protocol_elements: &[Type<'db>],
+    max_alternatives: usize,
+) -> TupleProtocolComplement<Vec<Type<'db>>> {
+    match plan_indexed_protocol_complement(db, ty, protocol_elements, max_alternatives) {
+        TupleProtocolComplement::NotApplicable => TupleProtocolComplement::NotApplicable,
+        TupleProtocolComplement::ExceedsLimit => TupleProtocolComplement::ExceedsLimit,
+        TupleProtocolComplement::Unchanged => TupleProtocolComplement::Unchanged,
+        TupleProtocolComplement::Alternatives(remaining_elements) => {
+            let Type::NominalInstance(instance) = ty else {
+                return TupleProtocolComplement::NotApplicable;
+            };
+            let Some(tuple) = instance.own_tuple_spec(db) else {
+                return TupleProtocolComplement::NotApplicable;
+            };
+            TupleProtocolComplement::Alternatives(
+                remaining_elements
+                    .into_iter()
+                    .map(|(index, remaining_element)| {
+                        let mut elements = tuple.all_elements().to_vec();
+                        elements[index] = remaining_element;
+                        Type::heterogeneous_tuple(db, elements)
+                    })
+                    .collect(),
+            )
+        }
+    }
 }
 
 /// Try to merge a complementary guarded pair into an unguarded core.
@@ -1391,12 +1413,12 @@ impl<'db> IntersectionBuilder<'db> {
                     continue;
                 };
 
-                let alternatives = match inner.subtract_indexed_protocol(
+                let alternatives = match inner.indexed_protocol_complement_alternative_count(
                     self.db,
                     &indexed,
                     MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
                 ) {
-                    Ok(Some(alternatives)) => alternatives.len(),
+                    Ok(Some(alternatives)) => alternatives,
                     Ok(None) => 1,
                     Err(()) => return false,
                 };
@@ -1524,6 +1546,28 @@ struct InnerIntersectionBuilder<'db> {
 }
 
 impl<'db> InnerIntersectionBuilder<'db> {
+    fn indexed_protocol_complement_alternative_count(
+        &self,
+        db: &'db dyn Db,
+        protocol_elements: &[Type<'db>],
+        max_alternatives: usize,
+    ) -> Result<Option<usize>, ()> {
+        for existing_positive in &self.positive {
+            return match plan_indexed_protocol_complement(
+                db,
+                *existing_positive,
+                protocol_elements,
+                max_alternatives,
+            ) {
+                TupleProtocolComplement::NotApplicable => continue,
+                TupleProtocolComplement::ExceedsLimit => Err(()),
+                TupleProtocolComplement::Unchanged => Ok(Some(1)),
+                TupleProtocolComplement::Alternatives(alternatives) => Ok(Some(alternatives.len())),
+            };
+        }
+        Ok(None)
+    }
+
     fn subtract_indexed_protocol(
         &self,
         db: &'db dyn Db,
@@ -1539,6 +1583,9 @@ impl<'db> InnerIntersectionBuilder<'db> {
             ) {
                 TupleProtocolComplement::NotApplicable => continue,
                 TupleProtocolComplement::ExceedsLimit => return Err(()),
+                TupleProtocolComplement::Unchanged => {
+                    return Ok(Some(vec![self.clone()]));
+                }
                 TupleProtocolComplement::Alternatives(alternatives) => alternatives,
             };
 
