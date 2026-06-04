@@ -121,12 +121,6 @@ fn build_indexed_protocol_planning_intersection<'db>(
 const MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES: usize = 128;
 
 #[cfg(test)]
-std::thread_local! {
-    static INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 enum TupleProtocolComplement<T> {
     NotApplicable,
@@ -309,20 +303,9 @@ fn materialize_tuple_changes<'db>(
         .map(|(index, remaining_element)| {
             let mut elements = tuple.all_elements().to_vec();
             elements[index] = remaining_element;
-            materialize_tuple_elements(db, elements)
+            Type::heterogeneous_tuple(db, elements)
         })
         .collect()
-}
-
-fn materialize_tuple_elements<'db>(
-    db: &'db dyn Db,
-    elements: impl IntoIterator<Item = Type<'db>>,
-) -> Type<'db> {
-    #[cfg(test)]
-    INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
-        materializations.set(materializations.get() + 1);
-    });
-    Type::heterogeneous_tuple(db, elements)
 }
 
 /// Try to merge a complementary guarded pair into an unguarded core.
@@ -1777,7 +1760,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     .swap_remove_index(replacement.positive_index);
             }
             for replacement in replacements {
-                alternative.add_positive(db, materialize_tuple_elements(db, replacement.elements));
+                alternative.add_positive(db, Type::heterogeneous_tuple(db, replacement.elements));
             }
             if !alternative.positive.contains(&Type::Never) {
                 alternatives.push(alternative);
@@ -2674,7 +2657,7 @@ mod tests {
     }
 
     #[test]
-    fn tuple_protocol_complement_materialization_is_bounded() {
+    fn tuple_protocol_complement_plan_is_bounded() {
         fn protocol_for<'db>(db: &'db TestDb, elements: &[Type<'db>]) -> Type<'db> {
             let pattern = exact_sequence_pattern_type(db, elements);
             let Type::Intersection(pattern) = pattern else {
@@ -2718,16 +2701,11 @@ mod tests {
             .add_negative(first_protocol)
             .add_negative(second_protocol);
         let protocols = builder.indexed_protocol_negatives();
-        assert!(builder.indexed_protocol_expansion_fits(&protocols));
-        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
-            .with(|materializations| materializations.set(0));
-        builder.build();
-        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
-            assert!(
-                materializations.get() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
-                "Tuple complement materialization exceeded the configured limit"
-            );
-        });
+        let plan = builder
+            .plan_indexed_protocol_complements(&protocols)
+            .expect("Expected tuple complements to fit within the configured limit");
+        assert!(plan.materializations > 0);
+        assert!(plan.materializations <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES);
     }
 
     #[test]
@@ -2780,25 +2758,22 @@ mod tests {
             [first_protocol, second_protocol],
             [second_protocol, first_protocol],
         ] {
-            super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
-                .with(|materializations| materializations.set(0));
-            IntersectionBuilder::new(&db)
+            let builder = IntersectionBuilder::new(&db)
                 .add_positive(first_tuple)
                 .add_positive(second_tuple)
                 .add_negative(first)
-                .add_negative(second)
-                .build();
-            super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
-                assert!(
-                    materializations.get() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
-                    "Tuple complement materialization exceeded the cumulative limit"
-                );
-            });
+                .add_negative(second);
+            let protocols = builder.indexed_protocol_negatives();
+            let plan = builder
+                .plan_indexed_protocol_complements(&protocols)
+                .expect("Expected the joint complement plan to fit");
+            assert!(plan.materializations > 0);
+            assert!(plan.materializations <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES);
         }
     }
 
     #[test]
-    fn nested_tuple_complement_planning_respects_materialization_budget() {
+    fn indexed_protocol_planning_keeps_nested_complement_symbolic() {
         fn protocol_for<'db>(db: &'db TestDb, pattern: Type<'db>) -> Type<'db> {
             let Type::Intersection(pattern) = pattern else {
                 panic!("Expected exact sequence pattern to be an intersection");
@@ -2816,23 +2791,18 @@ mod tests {
         let element = UnionType::from_two_elements(&db, int, str);
         let length = 12;
         let inner_tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
-        let inner_pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
-        let outer_tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(inner_tuple, length));
-        let outer_pattern = exact_sequence_pattern_type(&db, &vec![inner_pattern; length]);
-        let outer_protocol = protocol_for(&db, outer_pattern);
+        let inner_protocol =
+            protocol_for(&db, exact_sequence_pattern_type(&db, &vec![int; length]));
+        let remaining = super::build_indexed_protocol_planning_intersection(
+            &db,
+            [inner_tuple],
+            [inner_protocol],
+        );
 
-        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
-            .with(|materializations| materializations.set(0));
-        IntersectionBuilder::new(&db)
-            .add_positive(outer_tuple)
-            .add_negative(outer_protocol)
-            .build();
-        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
-            assert!(
-                materializations.get() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
-                "Nested tuple complement planning exceeded the materialization limit"
-            );
-        });
+        let Type::Intersection(remaining) = remaining else {
+            panic!("Expected nested tuple complement to remain symbolic");
+        };
+        assert!(remaining.negative(&db).contains(&inner_protocol));
     }
 
     #[test]
@@ -2865,30 +2835,17 @@ mod tests {
         let mut inner = super::InnerIntersectionBuilder::default();
         inner.add_positive(&db, outer_tuple);
 
-        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
-            .with(|materializations| materializations.set(0));
-        for int_index in 0..length {
-            for str_index in 0..length {
-                let replacements = inner
-                    .plan_tuple_replacements(
-                        &db,
-                        vec![(0, int_index, int_remaining), (0, str_index, str_remaining)],
-                    )
-                    .expect("Expected nested tuple replacements to remain possible");
-                assert_eq!(replacements.len(), 1);
-                super::materialize_tuple_elements(
-                    &db,
-                    replacements
-                        .into_iter()
-                        .next()
-                        .expect("Expected one outer tuple replacement")
-                        .elements,
-                );
-            }
-        }
-        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
-            assert_eq!(materializations.get(), length * length);
-        });
+        let replacements = inner
+            .plan_tuple_replacements(&db, vec![(0, 0, int_remaining), (0, 0, str_remaining)])
+            .expect("Expected nested tuple replacements to remain possible");
+        let [replacement] = replacements.as_slice() else {
+            panic!("Expected one outer tuple replacement");
+        };
+        let Type::Intersection(remaining) = replacement.elements[0] else {
+            panic!("Expected merged nested tuple complements to remain symbolic");
+        };
+        assert!(remaining.negative(&db).contains(&int_protocol));
+        assert!(remaining.negative(&db).contains(&str_protocol));
     }
 
     #[test]
