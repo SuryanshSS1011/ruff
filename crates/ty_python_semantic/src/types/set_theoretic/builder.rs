@@ -1569,28 +1569,47 @@ impl<'db> InnerIntersectionBuilder<'db> {
         protocol_elements: &[Type<'db>],
         max_alternatives: usize,
     ) -> Result<Option<InnerIndexedProtocolComplementPlan<'db>>, ()> {
+        let mut unchanged = false;
+        let mut exceeded_limit = false;
+        let mut best_alternatives = None;
+
         for (positive_index, existing_positive) in self.positive.iter().enumerate() {
-            return match plan_indexed_protocol_complement(
+            match plan_indexed_protocol_complement(
                 db,
                 *existing_positive,
                 protocol_elements,
                 max_alternatives,
             ) {
                 TupleProtocolComplementPlan::NotApplicable => continue,
-                TupleProtocolComplementPlan::ExceedsLimit => Err(()),
-                TupleProtocolComplementPlan::Unchanged => {
-                    Ok(Some(InnerIndexedProtocolComplementPlan::Unchanged))
-                }
+                TupleProtocolComplementPlan::ExceedsLimit => exceeded_limit = true,
+                TupleProtocolComplementPlan::Unchanged => unchanged = true,
                 TupleProtocolComplementPlan::Eliminated => {
-                    Ok(Some(InnerIndexedProtocolComplementPlan::Eliminated))
+                    return Ok(Some(InnerIndexedProtocolComplementPlan::Eliminated));
                 }
                 TupleProtocolComplementPlan::Alternatives(tuple_changes) => {
-                    Ok(Some(InnerIndexedProtocolComplementPlan::Alternatives {
-                        positive_index,
-                        tuple_changes,
-                    }))
+                    if best_alternatives
+                        .as_ref()
+                        .is_none_or(|(_, best): &(usize, Vec<_>)| {
+                            tuple_changes.len() < best.len()
+                        })
+                    {
+                        best_alternatives = Some((positive_index, tuple_changes));
+                    }
                 }
-            };
+            }
+        }
+
+        if unchanged {
+            return Ok(Some(InnerIndexedProtocolComplementPlan::Unchanged));
+        }
+        if let Some((positive_index, tuple_changes)) = best_alternatives {
+            return Ok(Some(InnerIndexedProtocolComplementPlan::Alternatives {
+                positive_index,
+                tuple_changes,
+            }));
+        }
+        if exceeded_limit {
+            return Err(());
         }
         Ok(None)
     }
@@ -2862,6 +2881,55 @@ mod tests {
                 .add_negative(protocols[2])
                 .build();
             assert!(result.is_never());
+        }
+    }
+
+    #[test]
+    fn tuple_protocol_complement_considers_all_positive_tuples() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let int_or_str = UnionType::from_two_elements(&db, int, str);
+        let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES + 1;
+        let expansive =
+            Type::heterogeneous_tuple(&db, std::iter::repeat_n(int_or_str, length));
+        let disjoint = Type::heterogeneous_tuple(
+            &db,
+            [str, Type::object()]
+                .into_iter()
+                .chain(std::iter::repeat_n(int_or_str, length - 2)),
+        );
+        let pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
+        let Type::Intersection(pattern) = pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let protocol = *pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+        let build = |first, second, negative| {
+            let mut builder = IntersectionBuilder::new(&db)
+                .add_positive(first)
+                .add_positive(second);
+            if negative {
+                builder = builder.add_negative(protocol);
+            }
+            builder.build()
+        };
+
+        let expansive_then_disjoint = build(expansive, disjoint, true);
+        let disjoint_then_expansive = build(disjoint, expansive, true);
+
+        assert!(expansive_then_disjoint
+            .is_equivalent_to(&db, build(expansive, disjoint, false)));
+        assert!(disjoint_then_expansive
+            .is_equivalent_to(&db, build(disjoint, expansive, false)));
+        for result in [expansive_then_disjoint, disjoint_then_expansive] {
+            let Type::Intersection(result) = result else {
+                panic!("Expected both tuple constraints to remain in an intersection");
+            };
+            assert!(!result.negative(&db).contains(&protocol));
         }
     }
 
