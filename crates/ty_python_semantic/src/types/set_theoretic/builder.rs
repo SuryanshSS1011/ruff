@@ -104,6 +104,12 @@ fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
 /// Limit the total number of intersection alternatives produced by tuple protocol complements.
 const MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES: usize = 128;
 
+#[cfg(test)]
+std::thread_local! {
+    static INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum TupleProtocolComplement<T> {
     NotApplicable,
@@ -227,6 +233,10 @@ fn subtract_indexed_protocol_from_tuple<'db>(
             let Some(tuple) = instance.own_tuple_spec(db) else {
                 return TupleProtocolComplement::NotApplicable;
             };
+            #[cfg(test)]
+            INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
+                materializations.set(materializations.get() + remaining_elements.len());
+            });
             TupleProtocolComplement::Alternatives(
                 remaining_elements
                     .into_iter()
@@ -1444,9 +1454,28 @@ impl<'db> IntersectionBuilder<'db> {
 
     fn try_distribute_indexed_protocol_negatives(
         &mut self,
-        protocols: FxOrderSet<Type<'db>>,
+        mut protocols: FxOrderSet<Type<'db>>,
     ) -> Result<(), ()> {
-        for protocol in protocols {
+        while !protocols.is_empty() {
+            // Apply shrinking complements first so they can remove branches before an expansive
+            // complement consumes the materialization limit.
+            let mut selected = None;
+            for protocol in &protocols {
+                let alternatives = self.indexed_protocol_expansion_count(*protocol)?;
+                if selected.is_none_or(|(_, selected_alternatives)| {
+                    alternatives < selected_alternatives
+                }) {
+                    selected = Some((*protocol, alternatives));
+                }
+            }
+            let Some((protocol, alternatives)) = selected else {
+                break;
+            };
+            if alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES {
+                return Err(());
+            }
+            protocols.swap_remove(&protocol);
+
             let Type::ProtocolInstance(protocol_instance) = protocol else {
                 continue;
             };
@@ -1491,6 +1520,37 @@ impl<'db> IntersectionBuilder<'db> {
         }
 
         Ok(())
+    }
+
+    fn indexed_protocol_expansion_count(&self, protocol: Type<'db>) -> Result<usize, ()> {
+        let Type::ProtocolInstance(protocol_instance) = protocol else {
+            return Ok(self.intersections.len());
+        };
+        let Some(indexed) = protocol_instance.finite_indexed_constraint(self.db) else {
+            return Ok(self.intersections.len());
+        };
+
+        let mut total_alternatives = 0usize;
+        for inner in &self.intersections {
+            if inner.positive.contains(&Type::Never) {
+                continue;
+            }
+            let alternatives = if inner.negative.contains(&protocol) {
+                match inner.indexed_protocol_complement_alternative_count(
+                    self.db,
+                    &indexed,
+                    MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+                ) {
+                    Ok(Some(alternatives)) => alternatives,
+                    Ok(None) => 1,
+                    Err(()) => return Err(()),
+                }
+            } else {
+                1
+            };
+            total_alternatives = total_alternatives.saturating_add(alternatives);
+        }
+        Ok(total_alternatives)
     }
 
     pub(crate) fn positive_elements<I, T>(mut self, elements: I) -> Self
@@ -2466,6 +2526,63 @@ mod tests {
             result.elements(&db).len(),
             MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
         );
+    }
+
+    #[test]
+    fn tuple_protocol_complement_materialization_is_bounded() {
+        fn protocol_for<'db>(db: &'db TestDb, elements: &[Type<'db>]) -> Type<'db> {
+            let pattern = exact_sequence_pattern_type(db, elements);
+            let Type::Intersection(pattern) = pattern else {
+                panic!("Expected exact sequence pattern to be an intersection");
+            };
+            *pattern
+                .positive(db)
+                .iter()
+                .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+                .expect("Expected exact sequence pattern to contain a protocol")
+        }
+
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let bytes = KnownClass::Bytes.to_instance(&db);
+        let zero = Type::int_literal(0);
+        let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES;
+        let first_tuple = Type::heterogeneous_tuple(
+            &db,
+            std::iter::once(UnionType::from_two_elements(&db, int, str))
+                .chain(std::iter::repeat_n(int, length - 1)),
+        );
+        let second_tuple = Type::heterogeneous_tuple(
+            &db,
+            std::iter::once(UnionType::from_two_elements(&db, int, bytes)).chain(
+                std::iter::repeat_n(UnionType::from_two_elements(&db, int, str), length - 1),
+            ),
+        );
+        let first_protocol = protocol_for(
+            &db,
+            &std::iter::once(str)
+                .chain(std::iter::repeat_n(zero, length - 1))
+                .collect::<Vec<_>>(),
+        );
+        let second_protocol = protocol_for(&db, &vec![int; length]);
+
+        let builder = IntersectionBuilder::new(&db)
+            .add_positive(first_tuple)
+            .add_positive(second_tuple)
+            .add_negative(first_protocol)
+            .add_negative(second_protocol);
+        let protocols = builder.indexed_protocol_negatives();
+        assert!(builder.indexed_protocol_expansion_fits(&protocols));
+        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
+            .with(|materializations| materializations.set(0));
+        builder.build();
+        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
+            assert!(
+                materializations.get() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+                "Tuple complement materialization exceeded the configured limit"
+            );
+        });
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
