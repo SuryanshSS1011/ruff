@@ -1032,13 +1032,15 @@ impl<'db> FunctionType<'db> {
         // function literal; doing so can re-enter recursive `TypeOf` evaluation.
         let (updated_signature, updated_last_definition_signature) = if matches!(
             type_mapping,
-            TypeMapping::ApplySpecialization(
-                ApplySpecialization::ReturnCallables(_) | ApplySpecialization::TypeAlias(_)
-            ) | TypeMapping::ApplySpecializationWithMaterialization {
-                specialization: ApplySpecialization::ReturnCallables(_)
-                    | ApplySpecialization::TypeAlias(_),
-                ..
-            }
+            TypeMapping::RescopeReturnCallables(_)
+                | TypeMapping::ApplySpecialization(
+                    ApplySpecialization::ReturnCallables(_) | ApplySpecialization::TypeAlias(_)
+                )
+                | TypeMapping::ApplySpecializationWithMaterialization {
+                    specialization: ApplySpecialization::ReturnCallables(_)
+                        | ApplySpecialization::TypeAlias(_),
+                    ..
+                }
         ) {
             (
                 self.updated_signature(db).map(|signature| {
