@@ -180,9 +180,9 @@ pub(crate) fn definite_match_pattern_type<'db>(
         PatternPredicateKind::Class(class_expr, kind) => {
             if kind.is_irrefutable() {
                 infer_same_file_expression_type(db, *class_expr, TypeContext::default())
-                    .to_instance(db)
+                    .as_class_literal()
+                    .map(|class| Type::instance(db, class.top_materialization(db)))
                     .unwrap_or(Type::Never)
-                    .top_materialization(db)
             } else {
                 Type::Never
             }
