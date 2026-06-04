@@ -101,6 +101,22 @@ fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
         .all(|element| !any_over_type(db, *element, true, |ty| ty.is_dynamic()))
 }
 
+/// Build an intersection used while planning indexed-protocol complements.
+///
+/// Planning can simplify ordinary intersections, but must leave nested indexed-protocol
+/// complements symbolic so that tuple materialization remains owned by the outer plan.
+fn build_indexed_protocol_planning_intersection<'db>(
+    db: &'db dyn Db,
+    positives: impl IntoIterator<Item = Type<'db>>,
+    negatives: impl IntoIterator<Item = Type<'db>>,
+) -> Type<'db> {
+    let mut builder = IntersectionBuilder::new(db).positive_elements(positives);
+    for negative in negatives {
+        builder = builder.add_negative(negative);
+    }
+    builder.build_without_indexed_protocol_distribution()
+}
+
 /// Limit the total number of intersection alternatives produced by tuple protocol complements.
 const MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES: usize = 128;
 
@@ -238,12 +254,11 @@ fn plan_indexed_protocol_complement<'db>(
             continue;
         }
 
-        let remaining_element = IntersectionBuilder::new(db)
-            .add_positive(*element)
-            .add_negative(*protocol_element)
-            // Recursively distributing another indexed protocol complement here would bypass the
-            // outer plan's materialization limit. Keep nested complements symbolic instead.
-            .build_without_indexed_protocol_distribution();
+        let remaining_element = build_indexed_protocol_planning_intersection(
+            db,
+            [*element],
+            [*protocol_element],
+        );
         if remaining_element.is_never() {
             continue;
         }
