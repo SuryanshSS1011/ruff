@@ -1218,13 +1218,16 @@ impl<'db> IntersectionBuilder<'db> {
     }
 
     pub(crate) fn add_positive(self, ty: Type<'db>) -> Self {
-        self.add_positive_impl(ty, &mut vec![])
+        let mut remaining_budget =
+            MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES.saturating_sub(self.intersections.len());
+        self.add_positive_impl(ty, &mut vec![], &mut remaining_budget)
     }
 
     pub(crate) fn add_positive_impl(
         mut self,
         ty: Type<'db>,
         seen_aliases: &mut Vec<Type<'db>>,
+        remaining_budget: &mut usize,
     ) -> Self {
         match ty {
             Type::TypeAlias(alias) => {
@@ -1237,7 +1240,7 @@ impl<'db> IntersectionBuilder<'db> {
                 }
                 seen_aliases.push(ty);
                 let value_type = alias.value_type(self.db);
-                self.add_positive_impl(value_type, seen_aliases)
+                self.add_positive_impl(value_type, seen_aliases, remaining_budget)
             }
             Type::Union(union) => {
                 // Distribute ourself over this union: for each union element, clone ourself and
@@ -1248,10 +1251,14 @@ impl<'db> IntersectionBuilder<'db> {
                 // (T2 & T4)`. If `self` is already a union-of-intersections `(T1 & T2) | (T3 & T4)`
                 // and we add `T5 | T6` to it, that flattens all the way out to `(T1 & T2 & T5) | (T1 &
                 // T2 & T6) | (T3 & T4 & T5) ...` -- you get the idea.
+                self.account_for_distribution(union.elements(self.db).len(), remaining_budget);
                 union
                     .elements(self.db)
                     .iter()
-                    .map(|elem| self.clone().add_positive_impl(*elem, seen_aliases))
+                    .map(|elem| {
+                        self.clone()
+                            .add_positive_impl(*elem, seen_aliases, remaining_budget)
+                    })
                     .fold(IntersectionBuilder::empty(self.db), |mut builder, sub| {
                         builder.intersections.extend(sub.intersections);
                         builder
@@ -1261,16 +1268,20 @@ impl<'db> IntersectionBuilder<'db> {
             Type::Intersection(other) => {
                 let db = self.db;
                 for pos in other.positive(db) {
-                    self = self.add_positive_impl(*pos, seen_aliases);
+                    self = self.add_positive_impl(*pos, seen_aliases, remaining_budget);
                 }
                 for neg in other.negative(db) {
-                    self = self.add_negative_impl(*neg, seen_aliases);
+                    self = self.add_negative_impl(*neg, seen_aliases, remaining_budget);
                 }
                 self
             }
             Type::EnumComplement(complement) => {
                 let db = self.db;
-                self.add_positive_impl(complement.to_intersection(db), seen_aliases)
+                self.add_positive_impl(
+                    complement.to_intersection(db),
+                    seen_aliases,
+                    remaining_budget,
+                )
             }
             _ => {
                 // If we are already a union-of-intersections, distribute the new intersected element
@@ -1289,8 +1300,6 @@ impl<'db> IntersectionBuilder<'db> {
                     return self;
                 }
 
-                let mut remaining_budget = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
-                    .saturating_sub(self.intersections.len());
                 self.intersections = self
                     .intersections
                     .into_iter()
@@ -1298,7 +1307,7 @@ impl<'db> IntersectionBuilder<'db> {
                         inner.add_positive_distributing_indexed_protocol_negatives(
                             self.db,
                             ty,
-                            &mut remaining_budget,
+                            remaining_budget,
                         )
                     })
                     .collect();
@@ -1308,13 +1317,16 @@ impl<'db> IntersectionBuilder<'db> {
     }
 
     pub(crate) fn add_negative(self, ty: Type<'db>) -> Self {
-        self.add_negative_impl(ty, &mut vec![])
+        let mut remaining_budget =
+            MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES.saturating_sub(self.intersections.len());
+        self.add_negative_impl(ty, &mut vec![], &mut remaining_budget)
     }
 
     pub(crate) fn add_negative_impl(
         mut self,
         ty: Type<'db>,
         seen_aliases: &mut Vec<Type<'db>>,
+        remaining_budget: &mut usize,
     ) -> Self {
         // See comments above in `add_positive`; this is just the negated version.
         match ty {
@@ -1328,11 +1340,11 @@ impl<'db> IntersectionBuilder<'db> {
                 }
                 seen_aliases.push(ty);
                 let value_type = alias.value_type(self.db);
-                self.add_negative_impl(value_type, seen_aliases)
+                self.add_negative_impl(value_type, seen_aliases, remaining_budget)
             }
             Type::Union(union) => {
                 for elem in union.elements(self.db) {
-                    self = self.add_negative_impl(*elem, seen_aliases);
+                    self = self.add_negative_impl(*elem, seen_aliases, remaining_budget);
                 }
                 self
             }
@@ -1343,43 +1355,42 @@ impl<'db> IntersectionBuilder<'db> {
                 // i.e. if we have an intersection of positive constraints C
                 // and negative constraints D, then our new intersection
                 // is (existing & ~C) | (existing & D)
+                self.account_for_distribution(
+                    intersection.positive(self.db).len() + intersection.negative(self.db).len(),
+                    remaining_budget,
+                );
 
-                let positive_side = intersection
-                    .positive(self.db)
-                    .iter()
-                    // we negate all the positive constraints while distributing
-                    .map(|elem| {
-                        self.clone()
-                            .add_negative_impl(*elem, &mut seen_aliases.clone())
-                    });
-
-                let negative_side = intersection
-                    .negative(self.db)
-                    .iter()
-                    // all negative constraints end up becoming positive constraints
-                    .map(|elem| {
-                        self.clone()
-                            .add_positive_impl(*elem, &mut seen_aliases.clone())
-                    });
-
-                positive_side.chain(negative_side).fold(
-                    IntersectionBuilder::empty(self.db),
-                    |mut builder, sub| {
-                        builder.intersections.extend(sub.intersections);
-                        builder
-                    },
-                )
+                let mut builder = IntersectionBuilder::empty(self.db);
+                for elem in intersection.positive(self.db) {
+                    let sub = self.clone().add_negative_impl(
+                        *elem,
+                        &mut seen_aliases.clone(),
+                        remaining_budget,
+                    );
+                    builder.intersections.extend(sub.intersections);
+                }
+                for elem in intersection.negative(self.db) {
+                    let sub = self.clone().add_positive_impl(
+                        *elem,
+                        &mut seen_aliases.clone(),
+                        remaining_budget,
+                    );
+                    builder.intersections.extend(sub.intersections);
+                }
+                builder
             }
             Type::EnumComplement(complement) => {
                 let db = self.db;
-                self.add_negative_impl(complement.to_intersection(db), seen_aliases)
+                self.add_negative_impl(
+                    complement.to_intersection(db),
+                    seen_aliases,
+                    remaining_budget,
+                )
             }
             _ => {
                 if let Type::ProtocolInstance(protocol) = ty
                     && let Some(indexed) = protocol.finite_indexed_constraint(self.db)
                 {
-                    let mut remaining_budget = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
-                        .saturating_sub(self.intersections.len());
                     let mut distributed = Vec::new();
 
                     for mut inner in self.intersections {
@@ -1389,7 +1400,7 @@ impl<'db> IntersectionBuilder<'db> {
                             remaining_budget.saturating_add(1),
                         ) && consume_indexed_protocol_expansion_budget(
                             alternatives.len(),
-                            &mut remaining_budget,
+                            remaining_budget,
                         ) {
                             distributed.extend(alternatives);
                         } else {
@@ -1408,6 +1419,16 @@ impl<'db> IntersectionBuilder<'db> {
                 self
             }
         }
+    }
+
+    /// Account for alternatives created by ordinary DNF distribution, leaving only the remaining
+    /// room for finite indexed protocol complement expansion.
+    fn account_for_distribution(&self, alternatives: usize, remaining_budget: &mut usize) {
+        let additional_alternatives = self
+            .intersections
+            .len()
+            .saturating_mul(alternatives.saturating_sub(1));
+        *remaining_budget = remaining_budget.saturating_sub(additional_alternatives);
     }
 
     pub(crate) fn positive_elements<I, T>(mut self, elements: I) -> Self
@@ -2161,6 +2182,44 @@ mod tests {
             panic!("Expected complement beyond the limit to remain symbolic");
         };
         assert!(result.negative(&db).contains(&protocol));
+    }
+
+    #[test]
+    fn tuple_protocol_complement_budget_is_shared_across_positive_union_arms() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let bytes = KnownClass::Bytes.to_instance(&db);
+        let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES / 2 + 1;
+        let tuple_with_str = Type::heterogeneous_tuple(
+            &db,
+            std::iter::repeat_n(UnionType::from_two_elements(&db, int, str), length),
+        );
+        let tuple_with_bytes = Type::heterogeneous_tuple(
+            &db,
+            std::iter::repeat_n(UnionType::from_two_elements(&db, int, bytes), length),
+        );
+        let tuples = UnionType::from_two_elements(&db, tuple_with_str, tuple_with_bytes);
+        let pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
+        let Type::Intersection(pattern) = pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let protocol = *pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+
+        let negative_then_positive = IntersectionBuilder::new(&db)
+            .add_negative(protocol)
+            .add_positive(tuples)
+            .build();
+        let positive_then_negative = IntersectionBuilder::new(&db)
+            .add_positive(tuples)
+            .add_negative(protocol)
+            .build();
+
+        assert_eq!(negative_then_positive, positive_then_negative);
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
