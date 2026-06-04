@@ -328,6 +328,36 @@ def test_match_value_sequence(value: object) -> None:
             reveal_type(value[0])  # revealed: object
 ```
 
+## Known limitation: tuple subclasses can override iteration
+
+A `tuple[...]` annotation includes instances of tuple subclasses. We intentionally assume that these
+subclasses preserve the relationship between iteration and indexing provided by the builtin `tuple`
+class so that exact sequence patterns can refine ordinary tuple annotations.
+
+This is unsound when a subclass overrides `__iter__`. At runtime, the following subclass matches the
+sequence pattern because iteration yields a `str`, but inherited indexing still returns the stored
+`int`. We currently refine `value` to `tuple[str]` and accept the call to `first_str`.
+
+```py
+from collections.abc import Iterator
+
+class StringIteratingTuple(tuple[int | str]):
+    def __iter__(self) -> Iterator[str]:
+        return iter(("matched",))
+
+def first_str(value: tuple[str]) -> str:
+    return value[0]
+
+def demonstrate_tuple_subclass_limitation(value: tuple[int | str]) -> None:
+    match value:
+        case [str()]:
+            reveal_type(value)  # revealed: tuple[str]
+            first_str(value)
+
+# At runtime, the pattern matches, but `first_str` returns the stored integer.
+demonstrate_tuple_subclass_limitation(StringIteratingTuple((1,)))
+```
+
 ## Exact sequence patterns do not refine aliased `Any`
 
 For a fully static tuple, an exact sequence pattern can refine the tuple's element types. For

@@ -101,10 +101,16 @@ fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
         .all(|element| !any_over_type(db, *element, true, |ty| ty.is_dynamic()))
 }
 
-/// Refine a concrete tuple instance using finite indexed constraints from a protocol.
+/// Refine a tuple specialization using finite indexed constraints from a protocol.
 ///
-/// Returns `None` when `ty` is not an exact tuple instance, `Some(Never)` when the tuple shape is
+/// Returns `None` when `ty` is not a tuple specialization, `Some(Never)` when the tuple shape is
 /// disjoint from the protocol, and the refined tuple type otherwise.
+///
+/// This intentionally assumes that tuple subclasses preserve the relationship between iteration
+/// and indexing provided by the builtin `tuple` class. A tuple subclass can override `__iter__` so
+/// that a sequence pattern observes different element types than inherited indexing does, making
+/// this refinement unsound for that subclass. We accept this limitation to retain precise
+/// narrowing for ordinary tuple annotations.
 fn refine_tuple_with_indexed_protocol<'db>(
     db: &'db dyn Db,
     ty: Type<'db>,
