@@ -2875,32 +2875,60 @@ mod tests {
         let db = setup_db();
         let int = KnownClass::Int.to_instance(&db);
         let str = KnownClass::Str.to_instance(&db);
-        let element = UnionType::from_two_elements(&db, int, str);
-        let length = 12;
+        let bytes = KnownClass::Bytes.to_instance(&db);
+        let element = UnionType::from_elements(&db, [int, str, bytes]);
+        let length = 8;
         let inner_tuple =
             Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
-        let inner_protocol = protocol_for(
+        let int_protocol = protocol_for(
             &db,
             exact_sequence_pattern_type(&db, &vec![int; length]),
         );
+        let str_protocol = protocol_for(
+            &db,
+            exact_sequence_pattern_type(&db, &vec![str; length]),
+        );
+        let int_remaining = super::build_indexed_protocol_planning_intersection(
+            &db,
+            [inner_tuple],
+            [int_protocol],
+        );
+        let str_remaining = super::build_indexed_protocol_planning_intersection(
+            &db,
+            [inner_tuple],
+            [str_protocol],
+        );
         let outer_tuple =
             Type::heterogeneous_tuple(&db, std::iter::repeat_n(inner_tuple, length));
-        let outer_protocol = protocol_for(
-            &db,
-            exact_sequence_pattern_type(&db, &vec![inner_protocol; length]),
-        );
+        let mut inner = super::InnerIntersectionBuilder::default();
+        inner.add_positive(&db, outer_tuple);
 
         super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
             .with(|materializations| materializations.set(0));
-        IntersectionBuilder::new(&db)
-            .add_positive(outer_tuple)
-            .add_negative(outer_protocol)
-            .build();
+        for int_index in 0..length {
+            for str_index in 0..length {
+                let replacements = inner
+                    .plan_tuple_replacements(
+                        &db,
+                        vec![
+                            (0, int_index, int_remaining),
+                            (0, str_index, str_remaining),
+                        ],
+                    )
+                    .expect("Expected nested tuple replacements to remain possible");
+                assert_eq!(replacements.len(), 1);
+                super::materialize_tuple_elements(
+                    &db,
+                    replacements
+                        .into_iter()
+                        .next()
+                        .expect("Expected one outer tuple replacement")
+                        .elements,
+                );
+            }
+        }
         super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
-            assert!(
-                materializations.get() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
-                "Same-position nested complements exceeded the materialization limit"
-            );
+            assert_eq!(materializations.get(), length * length);
         });
     }
 
