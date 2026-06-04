@@ -241,7 +241,9 @@ fn plan_indexed_protocol_complement<'db>(
         let remaining_element = IntersectionBuilder::new(db)
             .add_positive(*element)
             .add_negative(*protocol_element)
-            .build();
+            // Recursively distributing another indexed protocol complement here would bypass the
+            // outer plan's materialization limit. Keep nested complements symbolic instead.
+            .build_without_indexed_protocol_distribution();
         if remaining_element.is_never() {
             continue;
         }
@@ -1543,11 +1545,15 @@ impl<'db> IntersectionBuilder<'db> {
     }
 
     pub(crate) fn build(self) -> Type<'db> {
+        self.distribute_indexed_protocol_negatives()
+            .build_without_indexed_protocol_distribution()
+    }
+
+    fn build_without_indexed_protocol_distribution(self) -> Type<'db> {
         let db = self.db;
-        let builder = self.distribute_indexed_protocol_negatives();
         UnionType::from_elements(
             db,
-            builder
+            self
                 .intersections
                 .into_iter()
                 .map(|inner| inner.build(db)),
@@ -2794,6 +2800,47 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn nested_tuple_complement_planning_respects_materialization_budget() {
+        fn protocol_for<'db>(db: &'db TestDb, pattern: Type<'db>) -> Type<'db> {
+            let Type::Intersection(pattern) = pattern else {
+                panic!("Expected exact sequence pattern to be an intersection");
+            };
+            *pattern
+                .positive(db)
+                .iter()
+                .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+                .expect("Expected exact sequence pattern to contain a protocol")
+        }
+
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let element = UnionType::from_two_elements(&db, int, str);
+        let length = 12;
+        let inner_tuple =
+            Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        let inner_pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
+        let outer_tuple =
+            Type::heterogeneous_tuple(&db, std::iter::repeat_n(inner_tuple, length));
+        let outer_pattern =
+            exact_sequence_pattern_type(&db, &vec![inner_pattern; length]);
+        let outer_protocol = protocol_for(&db, outer_pattern);
+
+        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
+            .with(|materializations| materializations.set(0));
+        IntersectionBuilder::new(&db)
+            .add_positive(outer_tuple)
+            .add_negative(outer_protocol)
+            .build();
+        super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
+            assert!(
+                materializations.get() <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+                "Nested tuple complement planning exceeded the materialization limit"
+            );
+        });
     }
 
     #[test]
