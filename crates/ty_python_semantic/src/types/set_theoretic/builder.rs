@@ -133,8 +133,7 @@ enum InnerIndexedProtocolComplementPlan<'db> {
     Unchanged,
     Eliminated,
     Alternatives {
-        positive_index: usize,
-        tuple_changes: Vec<(usize, Type<'db>)>,
+        tuple_changes: Vec<Vec<(usize, usize, Type<'db>)>>,
     },
 }
 
@@ -1571,7 +1570,8 @@ impl<'db> InnerIntersectionBuilder<'db> {
     ) -> Result<Option<InnerIndexedProtocolComplementPlan<'db>>, ()> {
         let mut unchanged = false;
         let mut exceeded_limit = false;
-        let mut best_alternatives = None;
+        let mut best_alternative_count = usize::MAX;
+        let mut best_alternatives = Vec::new();
 
         for (positive_index, existing_positive) in self.positive.iter().enumerate() {
             match plan_indexed_protocol_complement(
@@ -1587,13 +1587,16 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     return Ok(Some(InnerIndexedProtocolComplementPlan::Eliminated));
                 }
                 TupleProtocolComplementPlan::Alternatives(tuple_changes) => {
-                    if best_alternatives
-                        .as_ref()
-                        .is_none_or(|(_, best): &(usize, Vec<_>)| {
-                            tuple_changes.len() < best.len()
-                        })
-                    {
-                        best_alternatives = Some((positive_index, tuple_changes));
+                    match tuple_changes.len().cmp(&best_alternative_count) {
+                        std::cmp::Ordering::Less => {
+                            best_alternative_count = tuple_changes.len();
+                            best_alternatives.clear();
+                            best_alternatives.push((positive_index, tuple_changes));
+                        }
+                        std::cmp::Ordering::Equal => {
+                            best_alternatives.push((positive_index, tuple_changes));
+                        }
+                        std::cmp::Ordering::Greater => {}
                     }
                 }
             }
@@ -1602,10 +1605,25 @@ impl<'db> InnerIntersectionBuilder<'db> {
         if unchanged {
             return Ok(Some(InnerIndexedProtocolComplementPlan::Unchanged));
         }
-        if let Some((positive_index, tuple_changes)) = best_alternatives {
+        if !best_alternatives.is_empty() {
+            let mut combined = vec![Vec::new()];
+            for (positive_index, tuple_changes) in best_alternatives {
+                if combined.len().saturating_mul(tuple_changes.len()) > max_alternatives {
+                    return Err(());
+                }
+                combined = combined
+                    .into_iter()
+                    .flat_map(|alternative| {
+                        tuple_changes.iter().map(move |(element_index, remaining)| {
+                            let mut expanded = alternative.clone();
+                            expanded.push((positive_index, *element_index, *remaining));
+                            expanded
+                        })
+                    })
+                    .collect();
+            }
             return Ok(Some(InnerIndexedProtocolComplementPlan::Alternatives {
-                positive_index,
-                tuple_changes,
+                tuple_changes: combined,
             }));
         }
         if exceeded_limit {
@@ -1669,10 +1687,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                         alternatives: Vec::new(),
                     }));
                 }
-                InnerIndexedProtocolComplementPlan::Alternatives {
-                    positive_index,
-                    tuple_changes,
-                } => {
+                InnerIndexedProtocolComplementPlan::Alternatives { tuple_changes } => {
                     if alternatives
                         .len()
                         .saturating_mul(tuple_changes.len())
@@ -1683,9 +1698,9 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     alternatives = alternatives
                         .into_iter()
                         .flat_map(|alternative| {
-                            tuple_changes.iter().map(move |(element_index, remaining)| {
+                            tuple_changes.iter().map(move |tuple_changes| {
                                 let mut expanded = alternative.clone();
-                                expanded.push((positive_index, *element_index, *remaining));
+                                expanded.extend(tuple_changes.iter().copied());
                                 expanded
                             })
                         })
@@ -2930,6 +2945,42 @@ mod tests {
                 panic!("Expected both tuple constraints to remain in an intersection");
             };
             assert!(!result.negative(&db).contains(&protocol));
+        }
+    }
+
+    #[test]
+    fn equal_cost_tuple_complement_bases_preserve_same_precision() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let bytes = KnownClass::Bytes.to_instance(&db);
+        let int_or_str = UnionType::from_two_elements(&db, int, str);
+        let first_tuple = Type::heterogeneous_tuple(&db, [int_or_str, int_or_str]);
+        let second_tuple = Type::heterogeneous_tuple(
+            &db,
+            [UnionType::from_two_elements(&db, int, bytes), int_or_str],
+        );
+        let expected = Type::heterogeneous_tuple(&db, [int_or_str, str]);
+        let pattern = exact_sequence_pattern_type(&db, &[int, int]);
+        let Type::Intersection(pattern) = pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let protocol = *pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+
+        for [first, second] in [
+            [first_tuple, second_tuple],
+            [second_tuple, first_tuple],
+        ] {
+            let result = IntersectionBuilder::new(&db)
+                .add_positive(first)
+                .add_positive(second)
+                .add_negative(protocol)
+                .build();
+            assert!(result.is_assignable_to(&db, expected));
         }
     }
 
