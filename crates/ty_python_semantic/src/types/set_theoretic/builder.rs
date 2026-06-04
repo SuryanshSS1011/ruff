@@ -138,29 +138,23 @@ enum InnerIndexedProtocolComplementPlan<'db> {
     },
 }
 
-impl InnerIndexedProtocolComplementPlan<'_> {
-    fn alternative_count(&self) -> usize {
-        match self {
-            Self::Unchanged => 1,
-            Self::Eliminated => 0,
-            Self::Alternatives { tuple_changes, .. } => tuple_changes.len(),
-        }
-    }
-
-    fn materialization_count(&self) -> usize {
-        match self {
-            Self::Unchanged | Self::Eliminated => 0,
-            Self::Alternatives { tuple_changes, .. } => tuple_changes.len(),
-        }
-    }
+#[derive(Debug)]
+struct TupleReplacementPlan<'db> {
+    positive_index: usize,
+    elements: Vec<Type<'db>>,
 }
 
 #[derive(Debug)]
-struct IndexedProtocolExpansionPlan<'db> {
-    protocol: Type<'db>,
+struct InnerIndexedProtocolComplementsPlan<'db> {
+    handled_protocols: FxOrderSet<Type<'db>>,
+    alternatives: Vec<Vec<TupleReplacementPlan<'db>>>,
+}
+
+#[derive(Debug)]
+struct IndexedProtocolComplementsPlan<'db> {
     alternatives: usize,
     materializations: usize,
-    branches: Vec<Option<InnerIndexedProtocolComplementPlan<'db>>>,
+    branches: Vec<Option<InnerIndexedProtocolComplementsPlan<'db>>>,
 }
 
 /// Refine a tuple specialization using finite indexed constraints from a protocol.
@@ -285,6 +279,7 @@ fn subtract_indexed_protocol_from_tuple<'db>(
     }
 }
 
+#[cfg(test)]
 fn materialize_tuple_changes<'db>(
     db: &'db dyn Db,
     ty: Type<'db>,
@@ -296,18 +291,25 @@ fn materialize_tuple_changes<'db>(
     let Some(tuple) = instance.own_tuple_spec(db) else {
         return Vec::new();
     };
-    #[cfg(test)]
-    INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
-        materializations.set(materializations.get() + tuple_changes.len());
-    });
     tuple_changes
         .into_iter()
         .map(|(index, remaining_element)| {
             let mut elements = tuple.all_elements().to_vec();
             elements[index] = remaining_element;
-            Type::heterogeneous_tuple(db, elements)
+            materialize_tuple_elements(db, elements)
         })
         .collect()
+}
+
+fn materialize_tuple_elements<'db>(
+    db: &'db dyn Db,
+    elements: impl IntoIterator<Item = Type<'db>>,
+) -> Type<'db> {
+    #[cfg(test)]
+    INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS.with(|materializations| {
+        materializations.set(materializations.get() + 1);
+    });
+    Type::heterogeneous_tuple(db, elements)
 }
 
 /// Try to merge a complementary guarded pair into an unguarded core.
@@ -1438,63 +1440,40 @@ impl<'db> IntersectionBuilder<'db> {
         if protocols.is_empty() {
             return self;
         }
-        if !self.indexed_protocol_expansion_fits(&protocols) {
+        let Ok(plan) = self.plan_indexed_protocol_complements(&protocols) else {
             return self;
-        }
-
-        let mut trial = self.clone();
-        if trial
-            .try_distribute_indexed_protocol_negatives(protocols)
-            .is_err()
+        };
+        if plan.alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+            || plan.materializations > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
         {
             return self;
         }
-        trial
+
+        let db = self.db;
+        Self {
+            db,
+            intersections: self
+                .intersections
+                .into_iter()
+                .zip(plan.branches)
+                .flat_map(|(inner, branch_plan)| {
+                    if let Some(branch_plan) = branch_plan {
+                        inner.materialize_indexed_protocol_complements(db, branch_plan)
+                    } else {
+                        vec![inner]
+                    }
+                })
+                .collect(),
+        }
     }
 
+    #[cfg(test)]
     fn indexed_protocol_expansion_fits(&self, protocols: &FxOrderSet<Type<'db>>) -> bool {
-        let mut total_alternatives = 0usize;
-
-        for inner in &self.intersections {
-            if inner.positive.contains(&Type::Never) {
-                continue;
-            }
-            let mut branch_alternatives = 1usize;
-            for protocol in protocols {
-                if !inner.negative.contains(protocol) {
-                    continue;
-                }
-                let Type::ProtocolInstance(protocol) = protocol else {
-                    continue;
-                };
-                let Some(indexed) = protocol.finite_indexed_constraint(self.db) else {
-                    continue;
-                };
-
-                let alternatives = match inner.plan_indexed_protocol_complement(
-                    self.db,
-                    &indexed,
-                    MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
-                ) {
-                    Ok(Some(plan)) => plan.alternative_count(),
-                    Ok(None) => 1,
-                    Err(()) => return false,
-                };
-                branch_alternatives = branch_alternatives.saturating_mul(alternatives);
-                if total_alternatives.saturating_add(branch_alternatives)
-                    > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
-                {
-                    return false;
-                }
-            }
-
-            total_alternatives = total_alternatives.saturating_add(branch_alternatives);
-            if total_alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES {
-                return false;
-            }
-        }
-
-        true
+        self.plan_indexed_protocol_complements(protocols)
+            .is_ok_and(|plan| {
+                plan.alternatives <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+                    && plan.materializations <= MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+            })
     }
 
     fn indexed_protocol_negatives(&self) -> FxOrderSet<Type<'db>> {
@@ -1511,75 +1490,10 @@ impl<'db> IntersectionBuilder<'db> {
             .collect()
     }
 
-    fn try_distribute_indexed_protocol_negatives(
-        &mut self,
-        mut protocols: FxOrderSet<Type<'db>>,
-    ) -> Result<(), ()> {
-        let mut remaining_materializations = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES;
-        while !protocols.is_empty() {
-            // Apply shrinking complements first so they can remove branches before an expansive
-            // complement consumes the materialization limit.
-            let mut selected = None;
-            for protocol in &protocols {
-                let candidate = self.plan_indexed_protocol_expansion(*protocol)?;
-                if selected.as_ref().is_none_or(|selected: &IndexedProtocolExpansionPlan<'_>| {
-                    candidate.alternatives < selected.alternatives
-                }) {
-                    selected = Some(candidate);
-                }
-            }
-            let Some(plan) = selected else {
-                break;
-            };
-            if plan.alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES {
-                return Err(());
-            }
-            remaining_materializations = remaining_materializations
-                .checked_sub(plan.materializations)
-                .ok_or(())?;
-            let protocol = plan.protocol;
-            protocols.swap_remove(&protocol);
-
-            self.intersections = std::mem::take(&mut self.intersections)
-                .into_iter()
-                .zip(plan.branches)
-                .flat_map(|(mut inner, branch_plan)| {
-                    if let Some(branch_plan) = branch_plan {
-                        inner.negative.swap_remove(&protocol);
-                        let alternatives =
-                            inner.materialize_indexed_protocol_complement(self.db, branch_plan);
-                        alternatives
-                    } else {
-                        vec![inner]
-                    }
-                })
-                .collect();
-        }
-
-        Ok(())
-    }
-
-    fn plan_indexed_protocol_expansion(
+    fn plan_indexed_protocol_complements(
         &self,
-        protocol: Type<'db>,
-    ) -> Result<IndexedProtocolExpansionPlan<'db>, ()> {
-        let Type::ProtocolInstance(protocol_instance) = protocol else {
-            return Ok(IndexedProtocolExpansionPlan {
-                protocol,
-                alternatives: self.intersections.len(),
-                materializations: 0,
-                branches: vec![None; self.intersections.len()],
-            });
-        };
-        let Some(indexed) = protocol_instance.finite_indexed_constraint(self.db) else {
-            return Ok(IndexedProtocolExpansionPlan {
-                protocol,
-                alternatives: self.intersections.len(),
-                materializations: 0,
-                branches: vec![None; self.intersections.len()],
-            });
-        };
-
+        protocols: &FxOrderSet<Type<'db>>,
+    ) -> Result<IndexedProtocolComplementsPlan<'db>, ()> {
         let mut total_alternatives = 0usize;
         let mut total_materializations = 0usize;
         let mut branches = Vec::with_capacity(self.intersections.len());
@@ -1588,30 +1502,30 @@ impl<'db> IntersectionBuilder<'db> {
                 branches.push(None);
                 continue;
             }
-            let plan = if inner.negative.contains(&protocol) {
-                match inner.plan_indexed_protocol_complement(
-                    self.db,
-                    &indexed,
-                    MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
-                ) {
-                    Ok(plan) => plan,
-                    Err(()) => return Err(()),
-                }
-            } else {
-                None
-            };
-            let alternatives = plan
-                .as_ref()
-                .map_or(1, InnerIndexedProtocolComplementPlan::alternative_count);
-            let materializations = plan
-                .as_ref()
-                .map_or(0, InnerIndexedProtocolComplementPlan::materialization_count);
-            total_alternatives = total_alternatives.saturating_add(alternatives);
-            total_materializations = total_materializations.saturating_add(materializations);
+            let plan = inner.plan_indexed_protocol_complements(
+                self.db,
+                protocols,
+                MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+            )?;
+            total_alternatives = total_alternatives.saturating_add(
+                plan.as_ref().map_or(1, |plan| plan.alternatives.len()),
+            );
+            total_materializations = total_materializations.saturating_add(
+                plan.as_ref().map_or(0, |plan| {
+                    plan.alternatives
+                        .iter()
+                        .map(Vec::len)
+                        .sum::<usize>()
+                }),
+            );
+            if total_alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+                || total_materializations > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+            {
+                return Err(());
+            }
             branches.push(plan);
         }
-        Ok(IndexedProtocolExpansionPlan {
-            protocol,
+        Ok(IndexedProtocolComplementsPlan {
             alternatives: total_alternatives,
             materializations: total_materializations,
             branches,
@@ -1681,33 +1595,145 @@ impl<'db> InnerIntersectionBuilder<'db> {
         Ok(None)
     }
 
-    fn materialize_indexed_protocol_complement(
-        self,
+    /// Plan all finite indexed protocol complements against the original positive tuple types.
+    ///
+    /// Combining the sparse alternatives before materialization makes the result independent of
+    /// the order in which negative protocols were added.
+    fn plan_indexed_protocol_complements(
+        &self,
         db: &'db dyn Db,
-        plan: InnerIndexedProtocolComplementPlan<'db>,
-    ) -> Vec<Self> {
-        match plan {
-            InnerIndexedProtocolComplementPlan::Unchanged => vec![self],
-            InnerIndexedProtocolComplementPlan::Eliminated => Vec::new(),
-            InnerIndexedProtocolComplementPlan::Alternatives {
-                positive_index,
-                tuple_changes,
-            } => {
-                let existing_positive = self.positive[positive_index];
-                let remaining_types =
-                    materialize_tuple_changes(db, existing_positive, tuple_changes);
-                let mut alternatives = Vec::with_capacity(remaining_types.len());
-                for remaining in remaining_types {
-                    let mut alternative = self.clone();
-                    alternative.positive.swap_remove_index(positive_index);
-                    alternative.add_positive(db, remaining);
-                    if !alternative.positive.contains(&Type::Never) {
-                        alternatives.push(alternative);
-                    }
+        protocols: &FxOrderSet<Type<'db>>,
+        max_alternatives: usize,
+    ) -> Result<Option<InnerIndexedProtocolComplementsPlan<'db>>, ()> {
+        let mut handled_protocols = FxOrderSet::default();
+        let mut alternatives = vec![Vec::new()];
+
+        for protocol in protocols {
+            if !self.negative.contains(protocol) {
+                continue;
+            }
+            let Type::ProtocolInstance(protocol_instance) = protocol else {
+                continue;
+            };
+            let Some(indexed) = protocol_instance.finite_indexed_constraint(db) else {
+                continue;
+            };
+            let Some(plan) =
+                self.plan_indexed_protocol_complement(db, &indexed, max_alternatives)?
+            else {
+                continue;
+            };
+            handled_protocols.insert(*protocol);
+
+            match plan {
+                InnerIndexedProtocolComplementPlan::Unchanged => {}
+                InnerIndexedProtocolComplementPlan::Eliminated => {
+                    alternatives.clear();
+                    break;
                 }
-                alternatives
+                InnerIndexedProtocolComplementPlan::Alternatives {
+                    positive_index,
+                    tuple_changes,
+                } => {
+                    if alternatives
+                        .len()
+                        .saturating_mul(tuple_changes.len())
+                        > max_alternatives
+                    {
+                        return Err(());
+                    }
+                    alternatives = alternatives
+                        .into_iter()
+                        .flat_map(|alternative| {
+                            tuple_changes.iter().map(move |(element_index, remaining)| {
+                                let mut expanded = alternative.clone();
+                                expanded.push((positive_index, *element_index, *remaining));
+                                expanded
+                            })
+                        })
+                        .collect();
+                }
             }
         }
+
+        if handled_protocols.is_empty() {
+            return Ok(None);
+        }
+
+        let alternatives = alternatives
+            .into_iter()
+            .filter_map(|changes| self.plan_tuple_replacements(db, changes))
+            .collect();
+        Ok(Some(InnerIndexedProtocolComplementsPlan {
+            handled_protocols,
+            alternatives,
+        }))
+    }
+
+    fn plan_tuple_replacements(
+        &self,
+        db: &'db dyn Db,
+        changes: Vec<(usize, usize, Type<'db>)>,
+    ) -> Option<Vec<TupleReplacementPlan<'db>>> {
+        let mut replacements = FxOrderMap::<usize, Vec<Type<'db>>>::default();
+        for (positive_index, element_index, remaining_element) in changes {
+            let elements = replacements.entry(positive_index).or_insert_with(|| {
+                let Type::NominalInstance(instance) = self.positive[positive_index] else {
+                    return Vec::new();
+                };
+                instance
+                    .own_tuple_spec(db)
+                    .map_or_else(Vec::new, |tuple| tuple.all_elements().to_vec())
+            });
+            let element = *elements.get(element_index)?;
+            let refined = IntersectionBuilder::new(db)
+                .add_positive(element)
+                .add_positive(remaining_element)
+                .build();
+            if refined.is_never() {
+                return None;
+            }
+            elements[element_index] = refined;
+        }
+
+        let mut replacements = replacements
+            .into_iter()
+            .map(|(positive_index, elements)| TupleReplacementPlan {
+                positive_index,
+                elements,
+            })
+            .collect::<Vec<_>>();
+        replacements.sort_unstable_by_key(|replacement| replacement.positive_index);
+        Some(replacements)
+    }
+
+    fn materialize_indexed_protocol_complements(
+        self,
+        db: &'db dyn Db,
+        plan: InnerIndexedProtocolComplementsPlan<'db>,
+    ) -> Vec<Self> {
+        let mut alternatives = Vec::with_capacity(plan.alternatives.len());
+        for replacements in plan.alternatives {
+            let mut alternative = self.clone();
+            for protocol in &plan.handled_protocols {
+                alternative.negative.swap_remove(protocol);
+            }
+            for replacement in replacements.iter().rev() {
+                alternative
+                    .positive
+                    .swap_remove_index(replacement.positive_index);
+            }
+            for replacement in replacements {
+                alternative.add_positive(
+                    db,
+                    materialize_tuple_elements(db, replacement.elements),
+                );
+            }
+            if !alternative.positive.contains(&Type::Never) {
+                alternatives.push(alternative);
+            }
+        }
+        alternatives
     }
 
     /// Return `true` when an intersection excludes every member of an enum class.
@@ -2719,6 +2745,67 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn equal_cost_tuple_protocol_complements_are_order_independent() {
+        fn protocol_for<'db>(db: &'db TestDb, elements: &[Type<'db>]) -> Type<'db> {
+            let pattern = exact_sequence_pattern_type(db, elements);
+            let Type::Intersection(pattern) = pattern else {
+                panic!("Expected exact sequence pattern to be an intersection");
+            };
+            *pattern
+                .positive(db)
+                .iter()
+                .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+                .expect("Expected exact sequence pattern to contain a protocol")
+        }
+
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let bytes = KnownClass::Bytes.to_instance(&db);
+        let int_or_str = UnionType::from_two_elements(&db, int, str);
+        let trailing = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES + 1;
+        let first_tuple = Type::heterogeneous_tuple(
+            &db,
+            [int_or_str, int_or_str]
+                .into_iter()
+                .chain(std::iter::repeat_n(int, trailing)),
+        );
+        let second_tuple = Type::heterogeneous_tuple(
+            &db,
+            [UnionType::from_two_elements(&db, int, bytes), str]
+                .into_iter()
+                .chain(std::iter::repeat_n(int_or_str, trailing)),
+        );
+        let first_protocol = protocol_for(
+            &db,
+            &std::iter::once(str)
+                .chain(std::iter::repeat_n(Type::object(), trailing + 1))
+                .collect::<Vec<_>>(),
+        );
+        let second_protocol = protocol_for(
+            &db,
+            &[Type::object(), str]
+                .into_iter()
+                .chain(std::iter::repeat_n(int, trailing))
+                .collect::<Vec<_>>(),
+        );
+        let build = |first, second| {
+            IntersectionBuilder::new(&db)
+                .add_positive(first_tuple)
+                .add_positive(second_tuple)
+                .add_negative(first)
+                .add_negative(second)
+                .build()
+        };
+
+        let first_then_second = build(first_protocol, second_protocol);
+        let second_then_first = build(second_protocol, first_protocol);
+
+        assert!(first_then_second.is_never());
+        assert_eq!(first_then_second, second_then_first);
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
