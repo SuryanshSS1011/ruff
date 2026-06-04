@@ -104,18 +104,6 @@ fn all_elements_are_static(db: &dyn Db, elements: &[Type<'_>]) -> bool {
 /// Limit the total number of intersection alternatives produced by tuple protocol complements.
 const MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES: usize = 128;
 
-fn consume_indexed_protocol_expansion_budget(
-    alternatives: usize,
-    remaining_budget: &mut usize,
-) -> bool {
-    let additional_alternatives = alternatives.saturating_sub(1);
-    if additional_alternatives > *remaining_budget {
-        return false;
-    }
-    *remaining_budget -= additional_alternatives;
-    true
-}
-
 #[derive(Debug, Eq, PartialEq)]
 enum TupleProtocolComplement<T> {
     NotApplicable,
@@ -1376,7 +1364,7 @@ impl<'db> IntersectionBuilder<'db> {
         }
     }
 
-    fn distribute_indexed_protocol_negatives(self, remaining_budget: &mut usize) -> Self {
+    fn distribute_indexed_protocol_negatives(self) -> Self {
         let protocols = self.indexed_protocol_negatives();
         if protocols.is_empty() {
             return self;
@@ -1386,14 +1374,12 @@ impl<'db> IntersectionBuilder<'db> {
         }
 
         let mut trial = self.clone();
-        let mut trial_budget = *remaining_budget;
         if trial
-            .try_distribute_indexed_protocol_negatives(protocols, &mut trial_budget)
+            .try_distribute_indexed_protocol_negatives(protocols)
             .is_err()
         {
             return self;
         }
-        *remaining_budget = trial_budget;
         trial
     }
 
@@ -1401,6 +1387,9 @@ impl<'db> IntersectionBuilder<'db> {
         let mut total_alternatives = 0usize;
 
         for inner in &self.intersections {
+            if inner.positive.contains(&Type::Never) {
+                continue;
+            }
             let mut branch_alternatives = 1usize;
             for protocol in protocols {
                 if !inner.negative.contains(protocol) {
@@ -1456,7 +1445,6 @@ impl<'db> IntersectionBuilder<'db> {
     fn try_distribute_indexed_protocol_negatives(
         &mut self,
         protocols: FxOrderSet<Type<'db>>,
-        remaining_budget: &mut usize,
     ) -> Result<(), ()> {
         for protocol in protocols {
             let Type::ProtocolInstance(protocol_instance) = protocol else {
@@ -1466,7 +1454,6 @@ impl<'db> IntersectionBuilder<'db> {
                 continue;
             };
 
-            let mut protocol_budget = *remaining_budget;
             let mut plans = Vec::with_capacity(self.intersections.len());
             for inner in &self.intersections {
                 if !inner.negative.contains(&protocol) {
@@ -1477,15 +1464,9 @@ impl<'db> IntersectionBuilder<'db> {
                 match inner.subtract_indexed_protocol(
                     self.db,
                     &indexed,
-                    protocol_budget.saturating_add(1),
+                    MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
                 ) {
                     Ok(Some(mut alternatives)) => {
-                        if !consume_indexed_protocol_expansion_budget(
-                            alternatives.len(),
-                            &mut protocol_budget,
-                        ) {
-                            return Err(());
-                        }
                         for alternative in &mut alternatives {
                             alternative.negative.swap_remove(&protocol);
                         }
@@ -1496,7 +1477,6 @@ impl<'db> IntersectionBuilder<'db> {
                 }
             }
 
-            *remaining_budget = protocol_budget;
             self.intersections = std::mem::take(&mut self.intersections)
                 .into_iter()
                 .zip(plans)
@@ -1526,9 +1506,7 @@ impl<'db> IntersectionBuilder<'db> {
 
     pub(crate) fn build(self) -> Type<'db> {
         let db = self.db;
-        let mut remaining_budget =
-            MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES.saturating_sub(self.intersections.len());
-        let builder = self.distribute_indexed_protocol_negatives(&mut remaining_budget);
+        let builder = self.distribute_indexed_protocol_negatives();
         UnionType::from_elements(
             db,
             builder
@@ -2442,6 +2420,52 @@ mod tests {
             assert!(result.negative(&db).contains(&narrow_protocol));
             assert!(result.negative(&db).contains(&wide_protocol));
         }
+    }
+
+    #[test]
+    fn eliminated_tuple_arm_returns_complement_expansion_budget() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let element = UnionType::from_two_elements(&db, int, str);
+        let wide_length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES;
+        let singleton = Type::heterogeneous_tuple(&db, [int]);
+        let wide = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, wide_length));
+        let tuples = UnionType::from_two_elements(&db, singleton, wide);
+        let singleton_pattern = exact_sequence_pattern_type(&db, &[int]);
+        let Type::Intersection(singleton_pattern) = singleton_pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let singleton_protocol = *singleton_pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+        let wide_pattern = exact_sequence_pattern_type(&db, &vec![int; wide_length]);
+        let Type::Intersection(wide_pattern) = wide_pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let wide_protocol = *wide_pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+
+        let builder = IntersectionBuilder::new(&db)
+            .add_positive(tuples)
+            .add_negative(singleton_protocol)
+            .add_negative(wide_protocol);
+        let protocols = builder.indexed_protocol_negatives();
+        assert!(builder.indexed_protocol_expansion_fits(&protocols));
+        let result = builder.build();
+
+        let Type::Union(result) = result else {
+            panic!("Expected the wide tuple complement to expand, got {result:?}");
+        };
+        assert_eq!(
+            result.elements(&db).len(),
+            MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+        );
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
