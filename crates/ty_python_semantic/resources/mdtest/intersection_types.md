@@ -672,13 +672,9 @@ def _(
 
 ### Finite indexed protocol constraints
 
-Protocols with a literal `__len__` return type and one indexed `__getitem__` overload per element
-provide finite indexed constraints. Intersecting those constraints with an exact tuple refines each
-element.
-
-The element constraints must not contain type variables. This prevents method-local or unspecialized
-class type variables from escaping their binders into a tuple type. Protocols with additional
-members also remain symbolic because the indexed constraints do not describe their entire interface.
+Tuple simplification only uses synthesized finite indexed protocols, such as those created for exact
+sequence patterns. Class-based protocols remain symbolic because tuple types include instances of
+subclasses that can override `__len__` and `__getitem__`.
 
 ```toml
 [environment]
@@ -697,46 +693,30 @@ class ObjectStrPair(Protocol):
     @overload
     def __getitem__(self, index: Literal[1], /) -> str: ...
 
-class ExtendedObjectStrPair(ObjectStrPair, Protocol):
-    def extra(self, /) -> None: ...
-
-class GenericItemProtocol(Protocol):
-    def __len__(self, /) -> Literal[1]: ...
-    def __getitem__[T](self, index: Literal[0], /) -> T: ...
-
-type Identity[T] = T
-
-class AliasedGenericItemProtocol(Protocol):
-    def __len__(self, /) -> Literal[1]: ...
-    def __getitem__[T](self, index: Literal[0], /) -> Identity[T]: ...
-
-class GenericPair[T](Protocol):
+class IntPair(Protocol):
     def __len__(self, /) -> Literal[2]: ...
     @overload
-    def __getitem__(self, index: Literal[0], /) -> T: ...
+    def __getitem__(self, index: Literal[0], /) -> int: ...
     @overload
-    def __getitem__(self, index: Literal[1], /) -> str: ...
+    def __getitem__(self, index: Literal[1], /) -> int: ...
+
+class TwoInts(tuple[int, ...]):
+    def __len__(self, /) -> Literal[2]:
+        return 2
 
 def _(
     positive: Intersection[tuple[int | str, int | str], ObjectStrPair],
     reversed_positive: Intersection[ObjectStrPair, tuple[int | str, int | str]],
     negative: Intersection[tuple[int | str, int | str], Not[ObjectStrPair]],
-    extended: Intersection[tuple[int | str, int | str], ExtendedObjectStrPair],
-    specialized_generic: Intersection[tuple[int | str, int | str], GenericPair[int]],
-    unspecialized_generic: Intersection[tuple[int | str, int | str], GenericPair],
-    generic_positive: Intersection[tuple[int], GenericItemProtocol],
-    generic_negative: Intersection[tuple[int], Not[GenericItemProtocol]],
-    aliased_generic_positive: Intersection[tuple[int], AliasedGenericItemProtocol],
 ) -> None:
-    reveal_type(positive)  # revealed: tuple[int | str, str]
-    reveal_type(reversed_positive)  # revealed: tuple[int | str, str]
+    reveal_type(positive)  # revealed: tuple[int | str, int | str] & ObjectStrPair
+    reveal_type(reversed_positive)  # revealed: ObjectStrPair & tuple[int | str, int | str]
     reveal_type(negative)  # revealed: tuple[int | str, int | str] & ~ObjectStrPair
-    reveal_type(extended)  # revealed: tuple[int | str, int | str] & ExtendedObjectStrPair
-    reveal_type(specialized_generic)  # revealed: tuple[int, str]
-    reveal_type(unspecialized_generic)  # revealed: tuple[int | str, int | str] & GenericPair[Unknown]
-    reveal_type(generic_positive)  # revealed: tuple[int] & GenericItemProtocol
-    reveal_type(generic_negative)  # revealed: tuple[int] & ~GenericItemProtocol
-    reveal_type(aliased_generic_positive)  # revealed: tuple[int] & AliasedGenericItemProtocol
+
+def accepts_int_pair(value: Intersection[tuple[int, ...], IntPair]) -> None:
+    reveal_type(value)  # revealed: tuple[int, ...] & IntPair
+
+accepts_int_pair(TwoInts((1, 2)))
 ```
 
 ### Simplifications of `bool`, `AlwaysTruthy` and `AlwaysFalsy`
