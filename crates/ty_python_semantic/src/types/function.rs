@@ -986,6 +986,21 @@ pub(super) fn walk_function_type<'db, V: super::visitor::TypeVisitor<'db> + ?Siz
 
 #[salsa::tracked]
 impl<'db> FunctionType<'db> {
+    pub(crate) fn visit_updated_signatures(
+        self,
+        db: &'db dyn Db,
+        mut visit: impl FnMut(&Signature<'db>),
+    ) {
+        if let Some(callable_signature) = self.updated_signature(db) {
+            for signature in &callable_signature.overloads {
+                visit(signature);
+            }
+        }
+        if let Some(signature) = self.updated_last_definition_signature(db) {
+            visit(signature);
+        }
+    }
+
     pub(crate) fn with_inherited_generic_context(
         self,
         db: &'db dyn Db,
