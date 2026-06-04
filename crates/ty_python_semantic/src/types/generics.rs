@@ -1680,6 +1680,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         }
     }
 
+    pub(crate) fn returned_callable_rescoping_candidates(&self) -> InferableTypeVars<'db> {
+        self.inferable
+            .merge(self.db, self.pending.deferred_quantification)
+    }
+
     /// Build a specialization, using a caller-provided hook to select the solution for each
     /// typevar.
     ///
