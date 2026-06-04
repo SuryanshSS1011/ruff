@@ -162,6 +162,7 @@ fn subtract_indexed_protocol_from_tuple<'db>(
     db: &'db dyn Db,
     ty: Type<'db>,
     protocol_elements: &[Type<'db>],
+    max_alternatives: usize,
 ) -> Option<Vec<Type<'db>>> {
     if !all_elements_are_static(db, protocol_elements) {
         return None;
@@ -202,6 +203,9 @@ fn subtract_indexed_protocol_from_tuple<'db>(
             .build();
         if remaining_element.is_never() {
             continue;
+        }
+        if remaining_elements.len() == max_alternatives {
+            return None;
         }
         remaining_elements.push((index, remaining_element));
     }
@@ -1379,13 +1383,14 @@ impl<'db> IntersectionBuilder<'db> {
                     let mut distributed = Vec::new();
 
                     for mut inner in self.intersections {
-                        if let Some(alternatives) =
-                            inner.subtract_indexed_protocol(self.db, &indexed)
-                            && consume_indexed_protocol_expansion_budget(
-                                alternatives.len(),
-                                &mut remaining_budget,
-                            )
-                        {
+                        if let Some(alternatives) = inner.subtract_indexed_protocol(
+                            self.db,
+                            &indexed,
+                            remaining_budget.saturating_add(1),
+                        ) && consume_indexed_protocol_expansion_budget(
+                            alternatives.len(),
+                            &mut remaining_budget,
+                        ) {
                             distributed.extend(alternatives);
                         } else {
                             inner.add_negative(self.db, ty);
@@ -1455,7 +1460,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                 return None;
             };
             let indexed = protocol.finite_indexed_constraint(db)?;
-            self.subtract_indexed_protocol(db, &indexed)
+            self.subtract_indexed_protocol(db, &indexed, remaining_budget.saturating_add(1))
                 .map(|alternatives| (*negative, alternatives))
         });
 
@@ -1480,11 +1485,15 @@ impl<'db> InnerIntersectionBuilder<'db> {
         &self,
         db: &'db dyn Db,
         protocol_elements: &[Type<'db>],
+        max_alternatives: usize,
     ) -> Option<Vec<Self>> {
         for (index, existing_positive) in self.positive.iter().enumerate() {
-            let Some(remaining_types) =
-                subtract_indexed_protocol_from_tuple(db, *existing_positive, protocol_elements)
-            else {
+            let Some(remaining_types) = subtract_indexed_protocol_from_tuple(
+                db,
+                *existing_positive,
+                protocol_elements,
+                max_alternatives,
+            ) else {
                 continue;
             };
 
@@ -2109,7 +2118,7 @@ mod tests {
         let tuple = Type::heterogeneous_tuple(&db, [element, element]);
 
         assert_eq!(
-            subtract_indexed_protocol_from_tuple(&db, tuple, &[int, str]),
+            subtract_indexed_protocol_from_tuple(&db, tuple, &[int, str], usize::MAX),
             Some(vec![
                 Type::heterogeneous_tuple(&db, [str, element]),
                 Type::heterogeneous_tuple(&db, [element, int]),
@@ -2125,6 +2134,15 @@ mod tests {
         let element = UnionType::from_two_elements(&db, int, str);
         let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES + 1;
         let tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        assert_eq!(
+            subtract_indexed_protocol_from_tuple(
+                &db,
+                tuple,
+                &vec![int; length],
+                MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+            ),
+            None
+        );
         let pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
         let Type::Intersection(pattern) = pattern else {
             panic!("Expected exact sequence pattern to be an intersection");
