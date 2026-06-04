@@ -994,9 +994,8 @@ fn analyze_single_pattern_predicate_kind<'db>(
             truthiness
         }
         PatternPredicateKind::Class(class_expr, kind) => {
-            let class =
-                infer_same_file_expression_type(db, *class_expr, TypeContext::default())
-                    .as_class_literal();
+            let class = infer_same_file_expression_type(db, *class_expr, TypeContext::default())
+                .as_class_literal();
 
             class.map_or(Truthiness::Ambiguous, |class| {
                 let class_ty = Type::instance(db, class.top_materialization(db));

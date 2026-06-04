@@ -14,10 +14,10 @@ use crate::types::{
     CallableType, ClassBase, ClassLiteral, ClassType, IntersectionBuilder, IntersectionType,
     KnownClass, KnownInstanceType, LiteralValueTypeKind, Parameter, Parameters, Signature,
     SpecialFormType, SubclassOfInner, SubclassOfType, Truthiness, Type, TypeContext,
-    TypeVarBoundOrConstraints, UnionBuilder,
-    class_pattern_is_irrefutable, definite_match_pattern_type, definite_sequence_pattern_type,
-    exact_sequence_pattern_type, infer_expression_types, mapping_pattern_type,
-    sequence_pattern_type_builder, singleton_pattern_type, starred_sequence_pattern_type,
+    TypeVarBoundOrConstraints, UnionBuilder, class_pattern_is_irrefutable,
+    definite_match_pattern_type, definite_sequence_pattern_type, exact_sequence_pattern_type,
+    infer_expression_types, mapping_pattern_type, sequence_pattern_type_builder,
+    singleton_pattern_type, starred_sequence_pattern_type,
 };
 use ty_python_core::expression::Expression;
 use ty_python_core::place::{PlaceExpr, PlaceTable, ScopedPlaceId};
@@ -690,7 +690,7 @@ fn could_compare_equal<'db>(db: &'db dyn Db, left_ty: Type<'db>, right_ty: Type<
         if ty.as_enum_literal().is_some() || ty.is_enum(db) {
             ty.overrides_equality(db)
         } else {
-            ty.is_single_valued(db) && ty.as_literal_value().is_none() && ty.has_custom_eq(db)
+            ty.is_single_valued(db) && ty.equality_may_not_be_reflexive(db)
         }
     }) {
         return true;
