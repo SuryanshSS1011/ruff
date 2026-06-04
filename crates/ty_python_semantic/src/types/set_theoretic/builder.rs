@@ -1606,7 +1606,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
         max_alternatives: usize,
     ) -> Result<Option<InnerIndexedProtocolComplementsPlan<'db>>, ()> {
         let mut handled_protocols = FxOrderSet::default();
-        let mut alternatives = vec![Vec::new()];
+        let mut plans = Vec::new();
 
         for protocol in protocols {
             if !self.negative.contains(protocol) {
@@ -1626,10 +1626,29 @@ impl<'db> InnerIntersectionBuilder<'db> {
             handled_protocols.insert(*protocol);
 
             match plan {
+                InnerIndexedProtocolComplementPlan::Eliminated => {
+                    return Ok(Some(InnerIndexedProtocolComplementsPlan {
+                        handled_protocols,
+                        alternatives: Vec::new(),
+                    }));
+                }
+                plan => plans.push(plan),
+            }
+        }
+
+        if handled_protocols.is_empty() {
+            return Ok(None);
+        }
+
+        let mut alternatives = vec![Vec::new()];
+        for plan in plans {
+            match plan {
                 InnerIndexedProtocolComplementPlan::Unchanged => {}
                 InnerIndexedProtocolComplementPlan::Eliminated => {
-                    alternatives.clear();
-                    break;
+                    return Ok(Some(InnerIndexedProtocolComplementsPlan {
+                        handled_protocols,
+                        alternatives: Vec::new(),
+                    }));
                 }
                 InnerIndexedProtocolComplementPlan::Alternatives {
                     positive_index,
@@ -1654,10 +1673,6 @@ impl<'db> InnerIntersectionBuilder<'db> {
                         .collect();
                 }
             }
-        }
-
-        if handled_protocols.is_empty() {
-            return Ok(None);
         }
 
         let alternatives = alternatives
@@ -2806,6 +2821,48 @@ mod tests {
 
         assert!(first_then_second.is_never());
         assert_eq!(first_then_second, second_then_first);
+    }
+
+    #[test]
+    fn eliminating_tuple_protocol_precedes_cartesian_limit() {
+        fn protocol_for<'db>(db: &'db TestDb, elements: &[Type<'db>]) -> Type<'db> {
+            let pattern = exact_sequence_pattern_type(db, elements);
+            let Type::Intersection(pattern) = pattern else {
+                panic!("Expected exact sequence pattern to be an intersection");
+            };
+            *pattern
+                .positive(db)
+                .iter()
+                .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+                .expect("Expected exact sequence pattern to contain a protocol")
+        }
+
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let element = UnionType::from_two_elements(&db, int, str);
+        let length = 12;
+        let tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        let int_protocol = protocol_for(&db, &vec![int; length]);
+        let str_protocol = protocol_for(&db, &vec![str; length]);
+        let object_protocol = protocol_for(&db, &vec![Type::object(); length]);
+
+        for protocols in [
+            [int_protocol, str_protocol, object_protocol],
+            [int_protocol, object_protocol, str_protocol],
+            [str_protocol, int_protocol, object_protocol],
+            [str_protocol, object_protocol, int_protocol],
+            [object_protocol, int_protocol, str_protocol],
+            [object_protocol, str_protocol, int_protocol],
+        ] {
+            let result = IntersectionBuilder::new(&db)
+                .add_positive(tuple)
+                .add_negative(protocols[0])
+                .add_negative(protocols[1])
+                .add_negative(protocols[2])
+                .build();
+            assert!(result.is_never());
+        }
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
