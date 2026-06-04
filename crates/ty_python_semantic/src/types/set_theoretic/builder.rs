@@ -116,6 +116,13 @@ fn consume_indexed_protocol_expansion_budget(
     true
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum TupleProtocolComplement<'db> {
+    NotApplicable,
+    ExceedsLimit,
+    Alternatives(Vec<Type<'db>>),
+}
+
 /// Refine a tuple specialization using finite indexed constraints from a protocol.
 ///
 /// Returns `None` when `ty` is not a tuple specialization, `Some(Never)` when the tuple shape is
@@ -163,24 +170,26 @@ fn subtract_indexed_protocol_from_tuple<'db>(
     ty: Type<'db>,
     protocol_elements: &[Type<'db>],
     max_alternatives: usize,
-) -> Option<Vec<Type<'db>>> {
+) -> TupleProtocolComplement<'db> {
     if !all_elements_are_static(db, protocol_elements) {
-        return None;
+        return TupleProtocolComplement::NotApplicable;
     }
 
     let Type::NominalInstance(instance) = ty else {
-        return None;
+        return TupleProtocolComplement::NotApplicable;
     };
-    let tuple = instance.own_tuple_spec(db)?;
+    let Some(tuple) = instance.own_tuple_spec(db) else {
+        return TupleProtocolComplement::NotApplicable;
+    };
     let TupleSpec::Fixed(tuple) = tuple.as_ref() else {
-        return None;
+        return TupleProtocolComplement::NotApplicable;
     };
     if !all_elements_are_static(db, tuple.all_elements()) {
-        return None;
+        return TupleProtocolComplement::NotApplicable;
     }
 
     if tuple.len() != protocol_elements.len() {
-        return Some(vec![ty]);
+        return TupleProtocolComplement::Alternatives(vec![ty]);
     }
 
     let mut remaining_elements = Vec::new();
@@ -191,7 +200,7 @@ fn subtract_indexed_protocol_from_tuple<'db>(
         .enumerate()
     {
         if element.is_disjoint_from(db, *protocol_element) {
-            return Some(vec![ty]);
+            return TupleProtocolComplement::Alternatives(vec![ty]);
         }
         if element.is_subtype_of(db, *protocol_element) {
             continue;
@@ -205,12 +214,12 @@ fn subtract_indexed_protocol_from_tuple<'db>(
             continue;
         }
         if remaining_elements.len() == max_alternatives {
-            return None;
+            return TupleProtocolComplement::ExceedsLimit;
         }
         remaining_elements.push((index, remaining_element));
     }
 
-    Some(
+    TupleProtocolComplement::Alternatives(
         remaining_elements
             .into_iter()
             .map(|(index, remaining_element)| {
@@ -1220,7 +1229,7 @@ impl<'db> IntersectionBuilder<'db> {
     pub(crate) fn add_positive(self, ty: Type<'db>) -> Self {
         let mut remaining_budget =
             MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES.saturating_sub(self.intersections.len());
-        self.add_positive_impl(ty, &mut vec![], &mut remaining_budget)
+        self.add_positive_impl(ty, &mut vec![], &mut remaining_budget, true)
     }
 
     pub(crate) fn add_positive_impl(
@@ -1228,6 +1237,7 @@ impl<'db> IntersectionBuilder<'db> {
         ty: Type<'db>,
         seen_aliases: &mut Vec<Type<'db>>,
         remaining_budget: &mut usize,
+        normalize_tuple_complements: bool,
     ) -> Self {
         match ty {
             Type::TypeAlias(alias) => {
@@ -1240,7 +1250,12 @@ impl<'db> IntersectionBuilder<'db> {
                 }
                 seen_aliases.push(ty);
                 let value_type = alias.value_type(self.db);
-                self.add_positive_impl(value_type, seen_aliases, remaining_budget)
+                self.add_positive_impl(
+                    value_type,
+                    seen_aliases,
+                    remaining_budget,
+                    normalize_tuple_complements,
+                )
             }
             Type::Union(union) => {
                 // Distribute ourself over this union: for each union element, clone ourself and
@@ -1252,28 +1267,37 @@ impl<'db> IntersectionBuilder<'db> {
                 // and we add `T5 | T6` to it, that flattens all the way out to `(T1 & T2 & T5) | (T1 &
                 // T2 & T6) | (T3 & T4 & T5) ...` -- you get the idea.
                 self.account_for_distribution(union.elements(self.db).len(), remaining_budget);
-                union
+                let builder = union
                     .elements(self.db)
                     .iter()
                     .map(|elem| {
                         self.clone()
-                            .add_positive_impl(*elem, seen_aliases, remaining_budget)
+                            .add_positive_impl(*elem, seen_aliases, remaining_budget, false)
                     })
                     .fold(IntersectionBuilder::empty(self.db), |mut builder, sub| {
                         builder.intersections.extend(sub.intersections);
                         builder
-                    })
+                    });
+                if normalize_tuple_complements {
+                    builder.distribute_indexed_protocol_negatives(remaining_budget)
+                } else {
+                    builder
+                }
             }
             // `(A & B & ~C) & (D & E & ~F)` -> `A & B & D & E & ~C & ~F`
             Type::Intersection(other) => {
                 let db = self.db;
                 for pos in other.positive(db) {
-                    self = self.add_positive_impl(*pos, seen_aliases, remaining_budget);
+                    self = self.add_positive_impl(*pos, seen_aliases, remaining_budget, false);
                 }
                 for neg in other.negative(db) {
-                    self = self.add_negative_impl(*neg, seen_aliases, remaining_budget);
+                    self = self.add_negative_impl(*neg, seen_aliases, remaining_budget, false);
                 }
-                self
+                if normalize_tuple_complements {
+                    self.distribute_indexed_protocol_negatives(remaining_budget)
+                } else {
+                    self
+                }
             }
             Type::EnumComplement(complement) => {
                 let db = self.db;
@@ -1281,37 +1305,18 @@ impl<'db> IntersectionBuilder<'db> {
                     complement.to_intersection(db),
                     seen_aliases,
                     remaining_budget,
+                    normalize_tuple_complements,
                 )
             }
             _ => {
-                // If we are already a union-of-intersections, distribute the new intersected element
-                // across all of those intersections.
-                if !self.intersections.iter().any(|inner| {
-                    inner.negative.iter().any(|negative| {
-                        let Type::ProtocolInstance(protocol) = negative else {
-                            return false;
-                        };
-                        protocol.finite_indexed_constraint(self.db).is_some()
-                    })
-                }) {
-                    for inner in &mut self.intersections {
-                        inner.add_positive(self.db, ty);
-                    }
-                    return self;
+                for inner in &mut self.intersections {
+                    inner.add_positive(self.db, ty);
                 }
-
-                self.intersections = self
-                    .intersections
-                    .into_iter()
-                    .flat_map(|inner| {
-                        inner.add_positive_distributing_indexed_protocol_negatives(
-                            self.db,
-                            ty,
-                            remaining_budget,
-                        )
-                    })
-                    .collect();
-                self
+                if normalize_tuple_complements {
+                    self.distribute_indexed_protocol_negatives(remaining_budget)
+                } else {
+                    self
+                }
             }
         }
     }
@@ -1319,7 +1324,7 @@ impl<'db> IntersectionBuilder<'db> {
     pub(crate) fn add_negative(self, ty: Type<'db>) -> Self {
         let mut remaining_budget =
             MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES.saturating_sub(self.intersections.len());
-        self.add_negative_impl(ty, &mut vec![], &mut remaining_budget)
+        self.add_negative_impl(ty, &mut vec![], &mut remaining_budget, true)
     }
 
     pub(crate) fn add_negative_impl(
@@ -1327,6 +1332,7 @@ impl<'db> IntersectionBuilder<'db> {
         ty: Type<'db>,
         seen_aliases: &mut Vec<Type<'db>>,
         remaining_budget: &mut usize,
+        normalize_tuple_complements: bool,
     ) -> Self {
         // See comments above in `add_positive`; this is just the negated version.
         match ty {
@@ -1340,13 +1346,22 @@ impl<'db> IntersectionBuilder<'db> {
                 }
                 seen_aliases.push(ty);
                 let value_type = alias.value_type(self.db);
-                self.add_negative_impl(value_type, seen_aliases, remaining_budget)
+                self.add_negative_impl(
+                    value_type,
+                    seen_aliases,
+                    remaining_budget,
+                    normalize_tuple_complements,
+                )
             }
             Type::Union(union) => {
                 for elem in union.elements(self.db) {
-                    self = self.add_negative_impl(*elem, seen_aliases, remaining_budget);
+                    self = self.add_negative_impl(*elem, seen_aliases, remaining_budget, false);
                 }
-                self
+                if normalize_tuple_complements {
+                    self.distribute_indexed_protocol_negatives(remaining_budget)
+                } else {
+                    self
+                }
             }
             Type::Intersection(intersection) => {
                 // (A | B) & ~(C & ~D)
@@ -1366,6 +1381,7 @@ impl<'db> IntersectionBuilder<'db> {
                         *elem,
                         &mut seen_aliases.clone(),
                         remaining_budget,
+                        false,
                     );
                     builder.intersections.extend(sub.intersections);
                 }
@@ -1374,10 +1390,15 @@ impl<'db> IntersectionBuilder<'db> {
                         *elem,
                         &mut seen_aliases.clone(),
                         remaining_budget,
+                        false,
                     );
                     builder.intersections.extend(sub.intersections);
                 }
-                builder
+                if normalize_tuple_complements {
+                    builder.distribute_indexed_protocol_negatives(remaining_budget)
+                } else {
+                    builder
+                }
             }
             Type::EnumComplement(complement) => {
                 let db = self.db;
@@ -1385,40 +1406,99 @@ impl<'db> IntersectionBuilder<'db> {
                     complement.to_intersection(db),
                     seen_aliases,
                     remaining_budget,
+                    normalize_tuple_complements,
                 )
             }
             _ => {
-                if let Type::ProtocolInstance(protocol) = ty
-                    && let Some(indexed) = protocol.finite_indexed_constraint(self.db)
-                {
-                    let mut distributed = Vec::new();
-
-                    for mut inner in self.intersections {
-                        if let Some(alternatives) = inner.subtract_indexed_protocol(
-                            self.db,
-                            &indexed,
-                            remaining_budget.saturating_add(1),
-                        ) && consume_indexed_protocol_expansion_budget(
-                            alternatives.len(),
-                            remaining_budget,
-                        ) {
-                            distributed.extend(alternatives);
-                        } else {
-                            inner.add_negative(self.db, ty);
-                            distributed.push(inner);
-                        }
-                    }
-
-                    self.intersections = distributed;
-                    return self;
-                }
-
                 for inner in &mut self.intersections {
                     inner.add_negative(self.db, ty);
                 }
-                self
+                if normalize_tuple_complements {
+                    self.distribute_indexed_protocol_negatives(remaining_budget)
+                } else {
+                    self
+                }
             }
         }
+    }
+
+    fn distribute_indexed_protocol_negatives(mut self, remaining_budget: &mut usize) -> Self {
+        let protocols: FxOrderSet<Type<'db>> = self
+            .intersections
+            .iter()
+            .flat_map(|inner| inner.negative.iter())
+            .filter(|negative| {
+                let Type::ProtocolInstance(protocol) = negative else {
+                    return false;
+                };
+                protocol.finite_indexed_constraint(self.db).is_some()
+            })
+            .copied()
+            .collect();
+
+        for protocol in protocols {
+            let Type::ProtocolInstance(protocol_instance) = protocol else {
+                continue;
+            };
+            let Some(indexed) = protocol_instance.finite_indexed_constraint(self.db) else {
+                continue;
+            };
+
+            let mut trial_budget = *remaining_budget;
+            let mut plans = Vec::with_capacity(self.intersections.len());
+            let mut exceeds_limit = false;
+            for inner in &self.intersections {
+                if !inner.negative.contains(&protocol) {
+                    plans.push(None);
+                    continue;
+                }
+
+                match inner.subtract_indexed_protocol(
+                    self.db,
+                    &indexed,
+                    trial_budget.saturating_add(1),
+                ) {
+                    Ok(Some(mut alternatives)) => {
+                        if !consume_indexed_protocol_expansion_budget(
+                            alternatives.len(),
+                            &mut trial_budget,
+                        ) {
+                            exceeds_limit = true;
+                            break;
+                        }
+                        for alternative in &mut alternatives {
+                            alternative.negative.swap_remove(&protocol);
+                        }
+                        plans.push(Some(alternatives));
+                    }
+                    Ok(None) => plans.push(None),
+                    Err(()) => {
+                        exceeds_limit = true;
+                        break;
+                    }
+                }
+            }
+
+            if exceeds_limit {
+                continue;
+            }
+
+            *remaining_budget = trial_budget;
+            self.intersections = self
+                .intersections
+                .into_iter()
+                .zip(plans)
+                .flat_map(|(inner, plan)| {
+                    if let Some(alternatives) = plan {
+                        alternatives
+                    } else {
+                        vec![inner]
+                    }
+                })
+                .collect();
+        }
+
+        self
     }
 
     /// Account for alternatives created by ordinary DNF distribution, leaving only the remaining
@@ -1459,63 +1539,22 @@ struct InnerIntersectionBuilder<'db> {
 }
 
 impl<'db> InnerIntersectionBuilder<'db> {
-    /// Add a positive type, then distribute any finite indexed protocol complements that constrain
-    /// the resulting positives.
-    fn add_positive_distributing_indexed_protocol_negatives(
-        mut self,
-        db: &'db dyn Db,
-        new_positive: Type<'db>,
-        remaining_budget: &mut usize,
-    ) -> Vec<Self> {
-        self.add_positive(db, new_positive);
-        self.distribute_indexed_protocol_negatives(db, remaining_budget)
-    }
-
-    fn distribute_indexed_protocol_negatives(
-        self,
-        db: &'db dyn Db,
-        remaining_budget: &mut usize,
-    ) -> Vec<Self> {
-        let applicable_negative = self.negative.iter().find_map(|negative| {
-            let Type::ProtocolInstance(protocol) = negative else {
-                return None;
-            };
-            let indexed = protocol.finite_indexed_constraint(db)?;
-            self.subtract_indexed_protocol(db, &indexed, remaining_budget.saturating_add(1))
-                .map(|alternatives| (*negative, alternatives))
-        });
-
-        let Some((negative, alternatives)) = applicable_negative else {
-            return vec![self];
-        };
-
-        if !consume_indexed_protocol_expansion_budget(alternatives.len(), remaining_budget) {
-            return vec![self];
-        }
-
-        alternatives
-            .into_iter()
-            .flat_map(|mut alternative| {
-                alternative.negative.swap_remove(&negative);
-                alternative.distribute_indexed_protocol_negatives(db, remaining_budget)
-            })
-            .collect()
-    }
-
     fn subtract_indexed_protocol(
         &self,
         db: &'db dyn Db,
         protocol_elements: &[Type<'db>],
         max_alternatives: usize,
-    ) -> Option<Vec<Self>> {
+    ) -> Result<Option<Vec<Self>>, ()> {
         for (index, existing_positive) in self.positive.iter().enumerate() {
-            let Some(remaining_types) = subtract_indexed_protocol_from_tuple(
+            let remaining_types = match subtract_indexed_protocol_from_tuple(
                 db,
                 *existing_positive,
                 protocol_elements,
                 max_alternatives,
-            ) else {
-                continue;
+            ) {
+                TupleProtocolComplement::NotApplicable => continue,
+                TupleProtocolComplement::ExceedsLimit => return Err(()),
+                TupleProtocolComplement::Alternatives(alternatives) => alternatives,
             };
 
             let mut alternatives = Vec::with_capacity(remaining_types.len());
@@ -1527,9 +1566,9 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     alternatives.push(alternative);
                 }
             }
-            return Some(alternatives);
+            return Ok(Some(alternatives));
         }
-        None
+        Ok(None)
     }
 
     /// Return `true` when an intersection excludes every member of an enum class.
@@ -2088,7 +2127,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
 mod tests {
     use super::{
         IntersectionBuilder, MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
-        MAX_NON_RECURSIVE_UNION_LITERALS, Type, UnionBuilder, UnionType,
+        MAX_NON_RECURSIVE_UNION_LITERALS, TupleProtocolComplement, Type, UnionBuilder, UnionType,
         subtract_indexed_protocol_from_tuple,
     };
 
@@ -2140,7 +2179,7 @@ mod tests {
 
         assert_eq!(
             subtract_indexed_protocol_from_tuple(&db, tuple, &[int, str], usize::MAX),
-            Some(vec![
+            TupleProtocolComplement::Alternatives(vec![
                 Type::heterogeneous_tuple(&db, [str, element]),
                 Type::heterogeneous_tuple(&db, [element, int]),
             ])
@@ -2162,7 +2201,7 @@ mod tests {
                 &vec![int; length],
                 MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
             ),
-            None
+            TupleProtocolComplement::ExceedsLimit
         );
         let pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
         let Type::Intersection(pattern) = pattern else {
@@ -2220,6 +2259,62 @@ mod tests {
             .build();
 
         assert_eq!(negative_then_positive, positive_then_negative);
+    }
+
+    #[test]
+    fn tuple_protocol_complement_expansion_is_independent_of_union_order() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let bytes = KnownClass::Bytes.to_instance(&db);
+        let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES / 2 + 1;
+        let tuple_with_str = Type::heterogeneous_tuple(
+            &db,
+            std::iter::repeat_n(UnionType::from_two_elements(&db, int, str), length),
+        );
+        let tuple_with_bytes = Type::heterogeneous_tuple(
+            &db,
+            std::iter::repeat_n(UnionType::from_two_elements(&db, int, bytes), length),
+        );
+        let pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
+        let Type::Intersection(pattern) = pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let protocol = *pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+
+        let forward = IntersectionBuilder::new(&db)
+            .add_positive(UnionType::from_two_elements(
+                &db,
+                tuple_with_str,
+                tuple_with_bytes,
+            ))
+            .add_negative(protocol)
+            .build();
+        let reverse = IntersectionBuilder::new(&db)
+            .add_positive(UnionType::from_two_elements(
+                &db,
+                tuple_with_bytes,
+                tuple_with_str,
+            ))
+            .add_negative(protocol)
+            .build();
+
+        for result in [forward, reverse] {
+            let Type::Union(result) = result else {
+                panic!("Expected the over-budget complement to remain a union");
+            };
+            assert_eq!(result.elements(&db).len(), 2);
+            assert!(result.elements(&db).iter().all(|element| {
+                let Type::Intersection(intersection) = element else {
+                    return false;
+                };
+                intersection.negative(&db).contains(&protocol)
+            }));
+        }
     }
 
     fn map_marker<'db>(ty: &Type<'db>, marker: Type<'db>, replacement: Type<'db>) -> Type<'db> {
