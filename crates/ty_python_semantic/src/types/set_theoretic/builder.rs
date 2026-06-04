@@ -1359,6 +1359,9 @@ impl<'db> IntersectionBuilder<'db> {
         if protocols.is_empty() {
             return self;
         }
+        if !self.indexed_protocol_expansion_fits(&protocols) {
+            return self;
+        }
 
         let mut trial = self.clone();
         let mut trial_budget = *remaining_budget;
@@ -1370,6 +1373,48 @@ impl<'db> IntersectionBuilder<'db> {
         }
         *remaining_budget = trial_budget;
         trial
+    }
+
+    fn indexed_protocol_expansion_fits(&self, protocols: &FxOrderSet<Type<'db>>) -> bool {
+        let mut total_alternatives = 0usize;
+
+        for inner in &self.intersections {
+            let mut branch_alternatives = 1usize;
+            for protocol in protocols {
+                if !inner.negative.contains(protocol) {
+                    continue;
+                }
+                let Type::ProtocolInstance(protocol) = protocol else {
+                    continue;
+                };
+                let Some(indexed) = protocol.finite_indexed_constraint(self.db) else {
+                    continue;
+                };
+
+                let alternatives = match inner.subtract_indexed_protocol(
+                    self.db,
+                    &indexed,
+                    MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
+                ) {
+                    Ok(Some(alternatives)) => alternatives.len(),
+                    Ok(None) => 1,
+                    Err(()) => return false,
+                };
+                branch_alternatives = branch_alternatives.saturating_mul(alternatives);
+                if total_alternatives.saturating_add(branch_alternatives)
+                    > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
+                {
+                    return false;
+                }
+            }
+
+            total_alternatives = total_alternatives.saturating_add(branch_alternatives);
+            if total_alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn indexed_protocol_negatives(&self) -> FxOrderSet<Type<'db>> {
@@ -2297,6 +2342,58 @@ mod tests {
             };
             assert!(result.negative(&db).contains(&int_protocol));
             assert!(result.negative(&db).contains(&str_protocol));
+        }
+    }
+
+    #[test]
+    fn asymmetric_tuple_protocol_complements_are_independent_of_negative_order() {
+        let db = setup_db();
+        let int = KnownClass::Int.to_instance(&db);
+        let str = KnownClass::Str.to_instance(&db);
+        let element = UnionType::from_two_elements(&db, int, str);
+        let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES + 1;
+        let tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        let narrow_pattern = exact_sequence_pattern_type(
+            &db,
+            &std::iter::once(str)
+                .chain(std::iter::repeat_n(Type::object(), length - 1))
+                .collect::<Vec<_>>(),
+        );
+        let Type::Intersection(narrow_pattern) = narrow_pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let narrow_protocol = *narrow_pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+        let wide_pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
+        let Type::Intersection(wide_pattern) = wide_pattern else {
+            panic!("Expected exact sequence pattern to be an intersection");
+        };
+        let wide_protocol = *wide_pattern
+            .positive(&db)
+            .iter()
+            .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
+            .expect("Expected exact sequence pattern to contain a protocol");
+
+        let narrow_then_wide = IntersectionBuilder::new(&db)
+            .add_positive(tuple)
+            .add_negative(narrow_protocol)
+            .add_negative(wide_protocol)
+            .build();
+        let wide_then_narrow = IntersectionBuilder::new(&db)
+            .add_positive(tuple)
+            .add_negative(wide_protocol)
+            .add_negative(narrow_protocol)
+            .build();
+
+        for result in [narrow_then_wide, wide_then_narrow] {
+            let Type::Intersection(result) = result else {
+                panic!("Expected over-budget complements to remain symbolic");
+            };
+            assert!(result.negative(&db).contains(&narrow_protocol));
+            assert!(result.negative(&db).contains(&wide_protocol));
         }
     }
 
