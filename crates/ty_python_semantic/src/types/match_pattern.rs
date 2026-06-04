@@ -1,13 +1,15 @@
 use ruff_python_ast as ast;
 use ruff_python_ast::name::Name;
-use ty_python_core::predicate::{PatternPredicateKind, SequencePatternPredicateKind};
+use ty_python_core::predicate::{
+    ClassPatternKind, PatternPredicateKind, SequencePatternPredicateKind,
+};
 
 use crate::Db;
 use crate::types::callable::{CallableFunctionProvenance, CallableTypeKind};
 use crate::types::signatures::CallableSignature;
 use crate::types::{
-    CallableType, IntersectionBuilder, KnownClass, Parameter, Parameters, Signature, Type,
-    TypeContext, UnionType, infer_same_file_expression_type,
+    CallableType, ClassLiteral, IntersectionBuilder, KnownClass, Parameter, Parameters, Signature,
+    Type, TypeContext, UnionType, infer_same_file_expression_type,
 };
 
 pub(crate) fn singleton_pattern_type(db: &dyn Db, singleton: ast::Singleton) -> Type<'_> {
@@ -32,6 +34,33 @@ pub(crate) fn sequence_pattern_type_builder(db: &dyn Db) -> IntersectionBuilder<
         .add_negative(KnownClass::Str.to_instance(db))
         .add_negative(KnownClass::Bytes.to_instance(db))
         .add_negative(KnownClass::Bytearray.to_instance(db))
+}
+
+pub(crate) fn class_pattern_is_irrefutable(
+    db: &dyn Db,
+    class: ClassLiteral<'_>,
+    kind: ClassPatternKind,
+) -> bool {
+    match kind {
+        ClassPatternKind::Irrefutable => true,
+        ClassPatternKind::MatchSelf => matches!(
+            class.known(db),
+            Some(
+                KnownClass::Bool
+                    | KnownClass::Bytearray
+                    | KnownClass::Bytes
+                    | KnownClass::Dict
+                    | KnownClass::Float
+                    | KnownClass::FrozenSet
+                    | KnownClass::Int
+                    | KnownClass::List
+                    | KnownClass::Set
+                    | KnownClass::Str
+                    | KnownClass::Tuple
+            )
+        ),
+        ClassPatternKind::Refutable => false,
+    }
 }
 
 fn sequence_pattern_getitem_method<'db>(
@@ -178,11 +207,15 @@ pub(crate) fn definite_match_pattern_type<'db>(
             }
         }
         PatternPredicateKind::Class(class_expr, kind) => {
-            if kind.is_irrefutable() {
+            let Some(class) =
                 infer_same_file_expression_type(db, *class_expr, TypeContext::default())
                     .as_class_literal()
-                    .map(|class| Type::instance(db, class.top_materialization(db)))
-                    .unwrap_or(Type::Never)
+            else {
+                return Type::Never;
+            };
+
+            if class_pattern_is_irrefutable(db, class, *kind) {
+                Type::instance(db, class.top_materialization(db))
             } else {
                 Type::Never
             }
