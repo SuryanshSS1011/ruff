@@ -1355,10 +1355,15 @@ impl<'db> IntersectionBuilder<'db> {
     }
 
     fn distribute_indexed_protocol_negatives(self, remaining_budget: &mut usize) -> Self {
+        let protocols = self.indexed_protocol_negatives();
+        if protocols.is_empty() {
+            return self;
+        }
+
         let mut trial = self.clone();
         let mut trial_budget = *remaining_budget;
         if trial
-            .try_distribute_indexed_protocol_negatives(&mut trial_budget)
+            .try_distribute_indexed_protocol_negatives(protocols, &mut trial_budget)
             .is_err()
         {
             return self;
@@ -1367,12 +1372,8 @@ impl<'db> IntersectionBuilder<'db> {
         trial
     }
 
-    fn try_distribute_indexed_protocol_negatives(
-        &mut self,
-        remaining_budget: &mut usize,
-    ) -> Result<(), ()> {
-        let protocols: FxOrderSet<Type<'db>> = self
-            .intersections
+    fn indexed_protocol_negatives(&self) -> FxOrderSet<Type<'db>> {
+        self.intersections
             .iter()
             .flat_map(|inner| inner.negative.iter())
             .filter(|negative| {
@@ -1382,8 +1383,14 @@ impl<'db> IntersectionBuilder<'db> {
                 protocol.finite_indexed_constraint(self.db).is_some()
             })
             .copied()
-            .collect();
+            .collect()
+    }
 
+    fn try_distribute_indexed_protocol_negatives(
+        &mut self,
+        protocols: FxOrderSet<Type<'db>>,
+        remaining_budget: &mut usize,
+    ) -> Result<(), ()> {
         for protocol in protocols {
             let Type::ProtocolInstance(protocol_instance) = protocol else {
                 continue;
@@ -2355,6 +2362,16 @@ mod tests {
 
         let intersection = IntersectionBuilder::new(&db).build();
         assert_eq!(intersection, Type::object());
+    }
+
+    #[test]
+    fn ordinary_intersection_has_no_indexed_protocol_negatives() {
+        let db = setup_db();
+        let builder = IntersectionBuilder::new(&db)
+            .add_positive(KnownClass::Int.to_instance(&db))
+            .add_negative(Type::int_literal(1));
+
+        assert!(builder.indexed_protocol_negatives().is_empty());
     }
 
     #[test]
