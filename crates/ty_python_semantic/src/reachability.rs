@@ -200,7 +200,7 @@ use crate::{
     types::{
         CallableTypes, ClassLiteral, IntersectionBuilder, NarrowingConstraint, Type, TypeContext,
         UnionType, definite_match_pattern_type, enum_metadata, infer_expression_type,
-        infer_narrowing_constraint, mapping_pattern_type, sequence_pattern_type,
+        infer_narrowing_constraint, mapping_pattern_type, sequence_pattern_type_builder,
         singleton_pattern_type,
     },
 };
@@ -1035,7 +1035,7 @@ fn analyze_single_pattern_predicate_kind<'db>(
             }
         }
         PatternPredicateKind::Sequence(kind) => {
-            let sequence_ty = sequence_pattern_type(db);
+            let sequence_ty = sequence_pattern_type_builder(db).build();
             if subject_ty.is_subtype_of(db, sequence_ty) {
                 if kind.is_irrefutable() {
                     Truthiness::AlwaysTrue

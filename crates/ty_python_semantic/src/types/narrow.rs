@@ -12,7 +12,7 @@ use crate::types::{
     KnownInstanceType, LiteralValueTypeKind, SpecialFormType, SubclassOfInner, SubclassOfType,
     Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnionBuilder,
     definite_sequence_pattern_type, exact_sequence_pattern_type, infer_expression_types,
-    mapping_pattern_type, sequence_pattern_type, singleton_pattern_type,
+    mapping_pattern_type, sequence_pattern_type_builder, singleton_pattern_type,
     starred_sequence_pattern_type,
 };
 use ty_python_core::expression::Expression;
@@ -2051,7 +2051,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             exact_sequence_pattern_type(self.db, &element_types)
         } else {
             let Some((prefix_patterns, suffix_patterns)) = kind.split_around_star() else {
-                return sequence_pattern_type(self.db);
+                return sequence_pattern_type_builder(self.db).build();
             };
 
             let prefix_element_types: Vec<_> = prefix_patterns
