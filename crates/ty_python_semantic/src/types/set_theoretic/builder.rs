@@ -254,11 +254,8 @@ fn plan_indexed_protocol_complement<'db>(
             continue;
         }
 
-        let remaining_element = build_indexed_protocol_planning_intersection(
-            db,
-            [*element],
-            [*protocol_element],
-        );
+        let remaining_element =
+            build_indexed_protocol_planning_intersection(db, [*element], [*protocol_element]);
         if remaining_element.is_never() {
             continue;
         }
@@ -1523,17 +1520,12 @@ impl<'db> IntersectionBuilder<'db> {
                 protocols,
                 MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES,
             )?;
-            total_alternatives = total_alternatives.saturating_add(
-                plan.as_ref().map_or(1, |plan| plan.alternatives.len()),
-            );
-            total_materializations = total_materializations.saturating_add(
-                plan.as_ref().map_or(0, |plan| {
-                    plan.alternatives
-                        .iter()
-                        .map(Vec::len)
-                        .sum::<usize>()
-                }),
-            );
+            total_alternatives = total_alternatives
+                .saturating_add(plan.as_ref().map_or(1, |plan| plan.alternatives.len()));
+            total_materializations =
+                total_materializations.saturating_add(plan.as_ref().map_or(0, |plan| {
+                    plan.alternatives.iter().map(Vec::len).sum::<usize>()
+                }));
             if total_alternatives > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
                 || total_materializations > MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES
             {
@@ -1568,10 +1560,7 @@ impl<'db> IntersectionBuilder<'db> {
         let db = self.db;
         UnionType::from_elements(
             db,
-            self
-                .intersections
-                .into_iter()
-                .map(|inner| inner.build(db)),
+            self.intersections.into_iter().map(|inner| inner.build(db)),
         )
     }
 }
@@ -1709,11 +1698,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     }));
                 }
                 InnerIndexedProtocolComplementPlan::Alternatives { tuple_changes } => {
-                    if alternatives
-                        .len()
-                        .saturating_mul(tuple_changes.len())
-                        > max_alternatives
-                    {
+                    if alternatives.len().saturating_mul(tuple_changes.len()) > max_alternatives {
                         return Err(());
                     }
                     alternatives = alternatives
@@ -1756,11 +1741,8 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     .map_or_else(Vec::new, |tuple| tuple.all_elements().to_vec())
             });
             let element = *elements.get(element_index)?;
-            let refined = build_indexed_protocol_planning_intersection(
-                db,
-                [element, remaining_element],
-                [],
-            );
+            let refined =
+                build_indexed_protocol_planning_intersection(db, [element, remaining_element], []);
             if refined.is_never() {
                 return None;
             }
@@ -1795,10 +1777,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
                     .swap_remove_index(replacement.positive_index);
             }
             for replacement in replacements {
-                alternative.add_positive(
-                    db,
-                    materialize_tuple_elements(db, replacement.elements),
-                );
+                alternative.add_positive(db, materialize_tuple_elements(db, replacement.elements));
             }
             if !alternative.positive.contains(&Type::Never) {
                 alternatives.push(alternative);
@@ -2836,13 +2815,10 @@ mod tests {
         let str = KnownClass::Str.to_instance(&db);
         let element = UnionType::from_two_elements(&db, int, str);
         let length = 12;
-        let inner_tuple =
-            Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        let inner_tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
         let inner_pattern = exact_sequence_pattern_type(&db, &vec![int; length]);
-        let outer_tuple =
-            Type::heterogeneous_tuple(&db, std::iter::repeat_n(inner_tuple, length));
-        let outer_pattern =
-            exact_sequence_pattern_type(&db, &vec![inner_pattern; length]);
+        let outer_tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(inner_tuple, length));
+        let outer_pattern = exact_sequence_pattern_type(&db, &vec![inner_pattern; length]);
         let outer_protocol = protocol_for(&db, outer_pattern);
 
         super::INDEXED_PROTOCOL_COMPLEMENT_MATERIALIZATIONS
@@ -2878,28 +2854,14 @@ mod tests {
         let bytes = KnownClass::Bytes.to_instance(&db);
         let element = UnionType::from_elements(&db, [int, str, bytes]);
         let length = 8;
-        let inner_tuple =
-            Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
-        let int_protocol = protocol_for(
-            &db,
-            exact_sequence_pattern_type(&db, &vec![int; length]),
-        );
-        let str_protocol = protocol_for(
-            &db,
-            exact_sequence_pattern_type(&db, &vec![str; length]),
-        );
-        let int_remaining = super::build_indexed_protocol_planning_intersection(
-            &db,
-            [inner_tuple],
-            [int_protocol],
-        );
-        let str_remaining = super::build_indexed_protocol_planning_intersection(
-            &db,
-            [inner_tuple],
-            [str_protocol],
-        );
-        let outer_tuple =
-            Type::heterogeneous_tuple(&db, std::iter::repeat_n(inner_tuple, length));
+        let inner_tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(element, length));
+        let int_protocol = protocol_for(&db, exact_sequence_pattern_type(&db, &vec![int; length]));
+        let str_protocol = protocol_for(&db, exact_sequence_pattern_type(&db, &vec![str; length]));
+        let int_remaining =
+            super::build_indexed_protocol_planning_intersection(&db, [inner_tuple], [int_protocol]);
+        let str_remaining =
+            super::build_indexed_protocol_planning_intersection(&db, [inner_tuple], [str_protocol]);
+        let outer_tuple = Type::heterogeneous_tuple(&db, std::iter::repeat_n(inner_tuple, length));
         let mut inner = super::InnerIntersectionBuilder::default();
         inner.add_positive(&db, outer_tuple);
 
@@ -2910,10 +2872,7 @@ mod tests {
                 let replacements = inner
                     .plan_tuple_replacements(
                         &db,
-                        vec![
-                            (0, int_index, int_remaining),
-                            (0, str_index, str_remaining),
-                        ],
+                        vec![(0, int_index, int_remaining), (0, str_index, str_remaining)],
                     )
                     .expect("Expected nested tuple replacements to remain possible");
                 assert_eq!(replacements.len(), 1);
@@ -3042,8 +3001,7 @@ mod tests {
         let str = KnownClass::Str.to_instance(&db);
         let int_or_str = UnionType::from_two_elements(&db, int, str);
         let length = MAX_INDEXED_PROTOCOL_COMPLEMENT_ALTERNATIVES + 1;
-        let expansive =
-            Type::heterogeneous_tuple(&db, std::iter::repeat_n(int_or_str, length));
+        let expansive = Type::heterogeneous_tuple(&db, std::iter::repeat_n(int_or_str, length));
         let disjoint = Type::heterogeneous_tuple(
             &db,
             [str, Type::object()]
@@ -3072,10 +3030,8 @@ mod tests {
         let expansive_then_disjoint = build(expansive, disjoint, true);
         let disjoint_then_expansive = build(disjoint, expansive, true);
 
-        assert!(expansive_then_disjoint
-            .is_equivalent_to(&db, build(expansive, disjoint, false)));
-        assert!(disjoint_then_expansive
-            .is_equivalent_to(&db, build(disjoint, expansive, false)));
+        assert!(expansive_then_disjoint.is_equivalent_to(&db, build(expansive, disjoint, false)));
+        assert!(disjoint_then_expansive.is_equivalent_to(&db, build(disjoint, expansive, false)));
         for result in [expansive_then_disjoint, disjoint_then_expansive] {
             let Type::Intersection(result) = result else {
                 panic!("Expected both tuple constraints to remain in an intersection");
@@ -3107,10 +3063,7 @@ mod tests {
             .find(|positive| matches!(positive, Type::ProtocolInstance(_)))
             .expect("Expected exact sequence pattern to contain a protocol");
 
-        for [first, second] in [
-            [first_tuple, second_tuple],
-            [second_tuple, first_tuple],
-        ] {
+        for [first, second] in [[first_tuple, second_tuple], [second_tuple, first_tuple]] {
             let result = IntersectionBuilder::new(&db)
                 .add_positive(first)
                 .add_positive(second)
