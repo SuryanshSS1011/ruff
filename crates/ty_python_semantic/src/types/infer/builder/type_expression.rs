@@ -871,7 +871,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         {
             starred_type
         } else {
-            Type::Dynamic(DynamicType::TodoStarredExpression)
+            Type::homogeneous_tuple(self.db(), Type::unknown())
         }
     }
 
@@ -2340,7 +2340,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 {
                     inner_ty
                 } else {
-                    todo_type!("`Unpack[]` special form")
+                    Type::homogeneous_tuple(self.db(), Type::unknown())
                 }
             }
             SpecialFormType::NoReturn
