@@ -1176,10 +1176,9 @@ impl<'db> Type<'db> {
             | DynamicType::UnknownGeneric(_)
             | DynamicType::UnspecializedTypeVar
             | DynamicType::AmbiguousOverload => false,
-            DynamicType::Todo(_)
-            | DynamicType::TodoStarredExpression
-            | DynamicType::TodoUnpack
-            | DynamicType::TodoTypeVarTuple => true,
+            DynamicType::Todo(_) | DynamicType::TodoStarredExpression | DynamicType::TodoUnpack => {
+                true
+            }
         })
     }
 
@@ -1920,7 +1919,6 @@ impl<'db> Type<'db> {
                 | DynamicType::UnknownGeneric(_)
                 | DynamicType::UnspecializedTypeVar
                 | DynamicType::TodoUnpack
-                | DynamicType::TodoTypeVarTuple
                 | DynamicType::Todo(_)
                 | DynamicType::InvalidConcatenateUnknown
                 | DynamicType::TodoStarredExpression
@@ -5691,9 +5689,9 @@ impl<'db> Type<'db> {
                 Some(KnownClass::TypeVar) => Ok(todo_type!(
                     "Support for `typing.TypeVar` instances in type expressions"
                 )),
-                Some(KnownClass::TypeVarTuple | KnownClass::ExtensionsTypeVarTuple) => {
-                    Ok(Type::Dynamic(DynamicType::TodoTypeVarTuple))
-                }
+                Some(KnownClass::TypeVarTuple | KnownClass::ExtensionsTypeVarTuple) => Ok(
+                    todo_type!("Support for `typing.TypeVarTuple` instances in type expressions"),
+                ),
                 _ => Err(InvalidTypeExpressionError {
                     invalid_expressions: smallvec_inline![InvalidTypeExpression::InvalidType(
                         *self, scope_id
@@ -6708,7 +6706,6 @@ impl<'db> Type<'db> {
                 DynamicType::Todo(_)
                 | DynamicType::TodoUnpack
                 | DynamicType::TodoStarredExpression
-                | DynamicType::TodoTypeVarTuple
                 | DynamicType::InvalidConcatenateUnknown
                 | DynamicType::UnspecializedTypeVar,
             )
@@ -7359,8 +7356,6 @@ pub enum DynamicType<'db> {
     TodoUnpack,
     /// A special Todo-variant for `*Ts`, so that we can treat it specially in `Generic[*Ts]`
     TodoStarredExpression,
-    /// A special Todo-variant for `TypeVarTuple` instances encountered in type expressions
-    TodoTypeVarTuple,
 }
 
 impl DynamicType<'_> {
@@ -7387,7 +7382,6 @@ impl std::fmt::Display for DynamicType<'_> {
             DynamicType::Todo(todo) => write!(f, "@Todo{todo}"),
             DynamicType::TodoUnpack => f.write_str("@Todo(typing.Unpack)"),
             DynamicType::TodoStarredExpression => f.write_str("@Todo(StarredExpression)"),
-            DynamicType::TodoTypeVarTuple => f.write_str("@Todo(TypeVarTuple)"),
         }
     }
 }
