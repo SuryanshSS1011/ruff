@@ -12,6 +12,10 @@ pub(super) struct DocstringSections<'a> {
 
 impl<'a> DocstringSections<'a> {
     pub(super) fn push(&mut self, kind: DocstringSectionKind, item: DocstringItem<'a>) {
+        if item.is_empty() {
+            return;
+        }
+
         match kind {
             DocstringSectionKind::Parameters => self.parameters.push(item),
             DocstringSectionKind::Attributes => self.attributes.push(item),
@@ -54,11 +58,15 @@ impl<'a> DocstringItem<'a> {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.name.is_none() && self.ty.is_none_or(str::is_empty) && self.description.is_empty()
+    }
+
     fn render_into(&self, output: &mut String) {
         let mut has_label = false;
 
         if let Some(name) = self.name {
-            output.push_str(&markdown_code_span(name));
+            push_markdown_code_span(output, name);
             has_label = true;
         }
 
@@ -68,10 +76,10 @@ impl<'a> DocstringItem<'a> {
             if has_label {
                 output.push(' ');
                 output.push('(');
-                output.push_str(&markdown_type_code_span(ty));
+                push_markdown_type_code_span(output, ty);
                 output.push(')');
             } else {
-                output.push_str(&markdown_type_code_span(ty));
+                push_markdown_type_code_span(output, ty);
                 has_label = true;
             }
         }
@@ -83,8 +91,10 @@ impl<'a> DocstringItem<'a> {
             }
             if starts_with_block {
                 output.push_str(self.description);
-            } else {
+            } else if self.description.contains('\n') {
                 output.push_str(&self.description.replace('\n', "\n    "));
+            } else {
+                output.push_str(self.description);
             }
         }
     }
@@ -107,7 +117,7 @@ fn render_markdown_section(output: &mut String, heading: &str, fields: &[Docstri
     for field in fields {
         if previous_description.is_some() {
             output.push('\n');
-            if previous_description.is_some_and(description_leaves_doctest_open) {
+            if previous_description.is_some_and(description_needs_blank_before_next_field) {
                 output.push('\n');
             }
         }
@@ -115,6 +125,11 @@ fn render_markdown_section(output: &mut String, heading: &str, fields: &[Docstri
         field.render_into(output);
         previous_description = Some(field.description);
     }
+}
+
+fn description_needs_blank_before_next_field(description: &str) -> bool {
+    description_leaves_doctest_open(description)
+        || description_starts_with_markdown_list(description)
 }
 
 fn description_leaves_doctest_open(description: &str) -> bool {
@@ -143,13 +158,54 @@ fn description_leaves_doctest_open(description: &str) -> bool {
 fn description_starts_with_markdown_block(description: &str) -> bool {
     description.lines().next().is_some_and(|first_line| {
         let first_line = first_line.trim_start_matches(' ');
-        markdown::MarkdownFence::find(first_line).is_some() || first_line.starts_with(">>>")
+        markdown::MarkdownFence::find(first_line).is_some()
+            || first_line.starts_with(">>>")
+            || starts_with_markdown_list_item(first_line)
     })
 }
 
-fn markdown_type_code_span(ty: &str) -> String {
+fn description_starts_with_markdown_list(description: &str) -> bool {
+    description.lines().next().is_some_and(|first_line| {
+        starts_with_markdown_list_item(first_line.trim_start_matches(' '))
+    })
+}
+
+fn starts_with_markdown_list_item(line: &str) -> bool {
+    starts_with_unordered_markdown_list_item(line) || starts_with_ordered_markdown_list_item(line)
+}
+
+fn starts_with_unordered_markdown_list_item(line: &str) -> bool {
+    matches!(
+        line.as_bytes(),
+        [b'-' | b'+' | b'*'] | [b'-' | b'+' | b'*', b' ' | b'\t', ..]
+    )
+}
+
+fn starts_with_ordered_markdown_list_item(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut digit_count = 0;
+
+    for byte in bytes {
+        if digit_count < 9 && byte.is_ascii_digit() {
+            digit_count += 1;
+            continue;
+        }
+
+        if digit_count > 0 && matches!(*byte, b'.' | b')') {
+            return bytes
+                .get(digit_count + 1)
+                .is_none_or(|byte| matches!(*byte, b' ' | b'\t'));
+        }
+
+        return false;
+    }
+
+    false
+}
+
+fn push_markdown_type_code_span(output: &mut String, ty: &str) {
     let normalized = normalized_type(ty);
-    markdown_code_span(&normalized)
+    push_markdown_code_span(output, &normalized);
 }
 
 fn normalized_type(ty: &str) -> Cow<'_, str> {
@@ -168,17 +224,25 @@ fn normalized_type(ty: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-fn markdown_code_span(text: &str) -> String {
+fn push_markdown_code_span(output: &mut String, text: &str) {
     let longest_backtick_run = text
         .split(|char| char != '`')
         .map(str::len)
         .max()
         .unwrap_or(0);
-    let delimiter = "`".repeat(longest_backtick_run + 1);
+    let delimiter_len = longest_backtick_run + 1;
+    for _ in 0..delimiter_len {
+        output.push('`');
+    }
     if text.starts_with('`') || text.ends_with('`') {
-        format!("{delimiter} {text} {delimiter}")
-    } else {
-        format!("{delimiter}{text}{delimiter}")
+        output.push(' ');
+    }
+    output.push_str(text);
+    if text.starts_with('`') || text.ends_with('`') {
+        output.push(' ');
+    }
+    for _ in 0..delimiter_len {
+        output.push('`');
     }
 }
 
@@ -248,6 +312,14 @@ mod tests {
         );
         sections.push(
             DocstringSectionKind::Parameters,
+            DocstringItem::new(Some("choices"), None, "- first\n- second"),
+        );
+        sections.push(
+            DocstringSectionKind::Parameters,
+            DocstringItem::new(Some("steps"), None, "1. first\n2. second"),
+        );
+        sections.push(
+            DocstringSectionKind::Parameters,
             DocstringItem::new(Some("other"), None, "Another parameter."),
         );
 
@@ -264,6 +336,14 @@ mod tests {
         ```
         `prompt`:
         >>> print('prompt')
+
+        `choices`:
+        - first
+        - second
+
+        `steps`:
+        1. first
+        2. second
 
         `other`: Another parameter.
         "#);
