@@ -1229,7 +1229,6 @@ impl<'db> ReachabilityEvaluationCache<'db> {
     pub(crate) fn evaluate(
         &self,
         db: &'db dyn Db,
-        scope: ScopeId<'db>,
         reachability_constraints: &ReachabilityConstraints,
         predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
         reachability: ScopedReachabilityConstraintId,
@@ -1240,6 +1239,18 @@ impl<'db> ReachabilityEvaluationCache<'db> {
             ScopedReachabilityConstraintId::AMBIGUOUS => return Truthiness::Ambiguous,
             _ => {}
         }
+
+        let predicate = predicates[reachability_constraints
+            .get_interior_node(reachability)
+            .atom()];
+        let scope = match predicate.node {
+            PredicateNode::Expression(expression) => expression.scope(db),
+            PredicateNode::IsNonTerminalCall(CallableAndCallExpr { callable, .. }) => {
+                callable.scope(db)
+            }
+            PredicateNode::Pattern(pattern) => pattern.scope(db),
+            PredicateNode::StarImportPlaceholder(star_import) => star_import.scope(db),
+        };
 
         if scope == self.primary_scope {
             if let Some(cached) = self.primary_entries.borrow().get(&reachability) {
@@ -1268,19 +1279,12 @@ impl<'db> ReachabilityEvaluationCache<'db> {
 pub(crate) fn evaluate_reachability_with_cache<'db>(
     db: &'db dyn Db,
     cache: Option<&ReachabilityEvaluationCache<'db>>,
-    scope: ScopeId<'db>,
     reachability_constraints: &ReachabilityConstraints,
     predicates: &IndexSlice<ScopedPredicateId, Predicate<'db>>,
     reachability: ScopedReachabilityConstraintId,
 ) -> Truthiness {
     if let Some(cache) = cache {
-        cache.evaluate(
-            db,
-            scope,
-            reachability_constraints,
-            predicates,
-            reachability,
-        )
+        cache.evaluate(db, reachability_constraints, predicates, reachability)
     } else {
         reachability_constraints.evaluate(db, predicates, reachability)
     }
@@ -1307,7 +1311,6 @@ impl<'db> DeclarationsIteratorExtension<'db> for DeclarationsIterator<'_, 'db> {
         db: &'db dyn Db,
         mut predicate: impl FnMut(DefinitionState<'db>) -> bool,
     ) -> bool {
-        let scope = self.scope();
         let predicates = self.predicates();
         let reachability_constraints = self.reachability_constraints();
 
@@ -1318,15 +1321,9 @@ impl<'db> DeclarationsIteratorExtension<'db> for DeclarationsIterator<'_, 'db> {
                  ..
              }| {
                 predicate(declaration)
-                    && !evaluate_reachability_with_cache(
-                        db,
-                        None,
-                        scope,
-                        reachability_constraints,
-                        predicates,
-                        reachability_constraint,
-                    )
-                    .is_always_false()
+                    && !reachability_constraints
+                        .evaluate(db, predicates, reachability_constraint)
+                        .is_always_false()
             },
         )
     }
@@ -1336,7 +1333,6 @@ impl<'db> DeclarationsIteratorExtension<'db> for DeclarationsIterator<'_, 'db> {
         db: &'db dyn Db,
         mut predicate: impl FnMut(DefinitionState<'db>) -> bool,
     ) -> Option<ScopedDefinitionId> {
-        let scope = self.scope();
         let reachability_predicates = self.predicates();
         let reachability_constraints = self.reachability_constraints();
 
@@ -1347,15 +1343,9 @@ impl<'db> DeclarationsIteratorExtension<'db> for DeclarationsIterator<'_, 'db> {
                  reachability_constraint,
              }| {
                 (predicate(declaration)
-                    && !evaluate_reachability_with_cache(
-                        db,
-                        None,
-                        scope,
-                        reachability_constraints,
-                        reachability_predicates,
-                        reachability_constraint,
-                    )
-                    .is_always_false())
+                    && !reachability_constraints
+                        .evaluate(db, reachability_predicates, reachability_constraint)
+                        .is_always_false())
                 .then_some(declaration_order)
             },
         )
