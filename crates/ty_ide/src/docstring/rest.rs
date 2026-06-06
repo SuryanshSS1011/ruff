@@ -199,7 +199,7 @@ impl FieldList {
             }
 
             let Some(field_list) = Self::parse(&mut lines) else {
-                preformatted_blocks.observe_non_field_line(line.text);
+                preformatted_blocks.observe_non_preformatted_line(line.text);
                 lines.next();
                 continue;
             };
@@ -505,7 +505,7 @@ impl TypedFieldRenderState {
 
 /// Recognizes preformatted blocks that may occur within a docstring (e.g. a markdown fence).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct PreformattedBlockScanner<'a> {
+pub(super) struct PreformattedBlockScanner<'a> {
     active_markdown_fence: Option<markdown::MarkdownFence<'a>>,
     active_doctest: bool,
     preformatted_block_state: PreformattedBlockState,
@@ -519,7 +519,7 @@ const QUOTED_LITERAL_BLOCK_QUOTE_CHARACTERS: &str = r##"!"#$%&'()*+,-./:;<=>?@[\
 impl<'a> PreformattedBlockScanner<'a> {
     /// Updates internal state to reflect the given line and returns whether or
     /// not the given line is contained within a preformatted block.
-    fn consume_preformatted_line(&mut self, line: &'a str) -> bool {
+    pub(super) fn consume_preformatted_line(&mut self, line: &'a str) -> bool {
         if let Some(fence) = self.active_markdown_fence {
             if fence.is_closed_by(line) {
                 self.active_markdown_fence = None;
@@ -613,7 +613,7 @@ impl<'a> PreformattedBlockScanner<'a> {
 
     /// Updates internal state that allows us to detect preformatted blocks introduced by reST
     /// syntax.
-    fn observe_non_field_line(&mut self, line: &str) {
+    pub(super) fn observe_non_preformatted_line(&mut self, line: &str) {
         if matches!(
             self.preformatted_block_state,
             PreformattedBlockState::Inactive
