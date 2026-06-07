@@ -1247,7 +1247,20 @@ mod tests {
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @"No type definitions found");
+        assert_snapshot!(test.goto_type_definition(), @r#"
+        info[goto-type definition]: Go to type definition
+         --> main.py:5:17
+          |
+        5 |             x = ab
+          |                 ^^ Clicking here
+          |
+        info: Found 1 type definition
+           --> stdlib/builtins.pyi:914:7
+            |
+        914 | class str(Sequence[str]):
+            |       ---
+            |
+        "#);
     }
 
     #[test]
@@ -1275,7 +1288,20 @@ mod tests {
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @"No type definitions found");
+        assert_snapshot!(test.goto_type_definition(), @r#"
+        info[goto-type definition]: Go to type definition
+         --> main.py:5:17
+          |
+        5 |             x = ab
+          |                 ^^ Clicking here
+          |
+        info: Found 1 type definition
+            --> stdlib/builtins.pyi:2864:7
+             |
+        2864 | class list(MutableSequence[_T]):
+             |       ----
+             |
+        "#);
     }
 
     #[test]
@@ -1303,7 +1329,20 @@ mod tests {
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @"No type definitions found");
+        assert_snapshot!(test.goto_type_definition(), @r#"
+        info[goto-type definition]: Go to type definition
+         --> main.py:5:17
+          |
+        5 |             x = ab
+          |                 ^^ Clicking here
+          |
+        info: Found 1 type definition
+           --> stdlib/builtins.pyi:914:7
+            |
+        914 | class str(Sequence[str]):
+            |       ---
+            |
+        "#);
     }
 
     #[test]
