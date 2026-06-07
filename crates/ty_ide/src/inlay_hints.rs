@@ -2145,7 +2145,30 @@ Source with applied edits:
         def my_func(command: str):
             match command.split():
                 case ["get", ab]:
-                    x[: @Todo] = ab
+                    x[: str] = ab
+
+        ---------------------------------------------
+        info[inlay-hint-location]: Inlay Hint Target
+           --> stdlib/builtins.pyi:914:7
+            |
+        914 | class str(Sequence[str]):
+            |       ^^^
+            |
+        info: Source
+         --> main2.py:5:17
+          |
+        5 |             x[: str] = ab
+          |                 ^^^
+          |
+
+        ---------------------------------------------
+        info[inlay-hint-edit]: Inlay hint edits
+        --> main.py:1:1
+        2 | def my_func(command: str):
+        3 |     match command.split():
+        4 |         case ["get", ab]:
+          -             x = ab
+        5 +             x: str = ab
         "#);
     }
 
@@ -2165,7 +2188,43 @@ Source with applied edits:
         def my_func(command: str):
             match command.split():
                 case ["get", *ab]:
-                    x[: @Todo] = ab
+                    x[: list[str]] = ab
+
+        ---------------------------------------------
+        info[inlay-hint-location]: Inlay Hint Target
+            --> stdlib/builtins.pyi:2864:7
+             |
+        2864 | class list(MutableSequence[_T]):
+             |       ^^^^
+             |
+        info: Source
+         --> main2.py:5:17
+          |
+        5 |             x[: list[str]] = ab
+          |                 ^^^^
+          |
+
+        info[inlay-hint-location]: Inlay Hint Target
+           --> stdlib/builtins.pyi:914:7
+            |
+        914 | class str(Sequence[str]):
+            |       ^^^
+            |
+        info: Source
+         --> main2.py:5:22
+          |
+        5 |             x[: list[str]] = ab
+          |                      ^^^
+          |
+
+        ---------------------------------------------
+        info[inlay-hint-edit]: Inlay hint edits
+        --> main.py:1:1
+        2 | def my_func(command: str):
+        3 |     match command.split():
+        4 |         case ["get", *ab]:
+          -             x = ab
+        5 +             x: list[str] = ab
         "#);
     }
 
@@ -2185,7 +2244,30 @@ Source with applied edits:
         def my_func(command: str):
             match command.split():
                 case ["get", ("a" | "b") as ab]:
-                    x[: @Todo] = ab
+                    x[: str] = ab
+
+        ---------------------------------------------
+        info[inlay-hint-location]: Inlay Hint Target
+           --> stdlib/builtins.pyi:914:7
+            |
+        914 | class str(Sequence[str]):
+            |       ^^^
+            |
+        info: Source
+         --> main2.py:5:17
+          |
+        5 |             x[: str] = ab
+          |                 ^^^
+          |
+
+        ---------------------------------------------
+        info[inlay-hint-edit]: Inlay hint edits
+        --> main.py:1:1
+        2 | def my_func(command: str):
+        3 |     match command.split():
+        4 |         case ["get", ("a" | "b") as ab]:
+          -             x = ab
+        5 +             x: str = ab
         "#);
     }
 
