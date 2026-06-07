@@ -225,6 +225,7 @@ pub(super) fn publish_diagnostics(document: &DocumentHandle, session: &Session, 
             publish_diagnostics_notification(document.url().clone(), diagnostics);
         }
         LspDiagnostics::NotebookDocument(cell_diagnostics) => {
+            #[expect(clippy::iter_over_hash_type)]
             for (cell_url, diagnostics) in cell_diagnostics {
                 publish_diagnostics_notification(cell_url, diagnostics);
             }
@@ -305,6 +306,7 @@ pub(crate) fn publish_settings_diagnostics(
     let global_settings = session.global_settings();
 
     // Send the settings diagnostics!
+    #[expect(clippy::iter_over_hash_type)]
     for (url, file_diagnostics) in diagnostics_by_url {
         // Convert diagnostics to LSP format
         let lsp_diagnostics = file_diagnostics

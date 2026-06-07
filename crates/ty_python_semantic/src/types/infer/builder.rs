@@ -444,6 +444,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.type_expression_flags
                 .extend(extra.type_expression_flags.iter().copied());
 
+            #[expect(clippy::iter_over_hash_type)]
             for (collection_def, constraints) in &extra.collection_use_constraints {
                 self.collection_use_constraints
                     .entry(*collection_def)
@@ -510,6 +511,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.type_expression_flags
                 .extend(extra.type_expression_flags.iter().copied());
 
+            #[expect(clippy::iter_over_hash_type)]
             for (collection_def, constraints) in &extra.collection_use_constraints {
                 self.collection_use_constraints
                     .entry(*collection_def)
@@ -537,6 +539,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             self.type_expression_flags
                 .extend(extra.type_expression_flags.iter().copied());
 
+            #[expect(clippy::iter_over_hash_type)]
             for (collection_def, constraints) in &extra.collection_use_constraints {
                 self.collection_use_constraints
                     .entry(*collection_def)
@@ -6202,6 +6205,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
     fn union_expected_types(&mut self, expected_types: &FxHashMap<ExpressionNodeKey, Type<'db>>) {
         let db = self.db();
+        #[expect(clippy::iter_over_hash_type)]
         for (expression, ty) in expected_types {
             self.expected_types
                 .entry(*expression)
@@ -10726,6 +10730,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .extend(bindings.iter().map(|(def, ty)| (*def, *ty)));
         }
 
+        #[expect(clippy::iter_over_hash_type)]
         for (collection_def, constraints) in &collection_use_constraints {
             self.collection_use_constraints
                 .entry(*collection_def)
