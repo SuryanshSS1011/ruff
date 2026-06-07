@@ -359,18 +359,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         module: &'ast ParsedModuleRef,
     ) -> Self {
         let scope = region.scope(db);
-        let reachability_cache = Rc::new(ReachabilityEvaluationCache::new(scope));
-        Self::new_with_reachability_cache(db, region, index, module, scope, reachability_cache)
-    }
+        let reachability_constraints = index
+            .use_def_map(scope.file_scope_id(db))
+            .reachability_constraints();
 
-    fn new_with_reachability_cache(
-        db: &'db dyn Db,
-        region: InferenceRegion<'db>,
-        index: &'db SemanticIndex<'db>,
-        module: &'ast ParsedModuleRef,
-        scope: ScopeId<'db>,
-        reachability_cache: Rc<ReachabilityEvaluationCache<'db>>,
-    ) -> Self {
         Self {
             context: InferContext::new(db, scope, module),
             index,
@@ -381,7 +373,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             deferred_state: DeferredExpressionState::None,
             expressions: FxHashMap::default(),
             expression_cache: None,
-            reachability_cache,
+            reachability_cache: Rc::new(ReachabilityEvaluationCache::new(
+                scope,
+                reachability_constraints,
+            )),
             qualifiers: FxHashMap::default(),
             type_expression_flags: FxHashMap::default(),
             collection_use_constraints: FxHashMap::default(),
@@ -10695,7 +10690,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             expressions: _,
             string_annotations: _,
             expected_types: _,
-            scope,
+            scope: _,
             bindings: _,
             declarations: _,
             deferred: _,
@@ -10706,14 +10701,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             type_expression_flags: _,
         } = *self;
 
-        let mut builder = TypeInferenceBuilder::new_with_reachability_cache(
-            self.db(),
-            region,
-            index,
-            self.module(),
-            scope,
-            Rc::clone(reachability_cache),
-        );
+        let mut builder = TypeInferenceBuilder::new(self.db(), region, index, self.module());
 
         // Speculated builders are often discarded immediately.
         builder.context.defuse();
@@ -10724,6 +10712,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         builder.typevar_binding_context = typevar_binding_context;
         builder.context.inference_flags = self.inference_flags();
         builder.expression_cache.clone_from(expression_cache);
+        builder.reachability_cache.clone_from(reachability_cache);
         builder
             .return_types_and_ranges
             .clone_from(return_types_and_ranges);
