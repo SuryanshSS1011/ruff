@@ -199,9 +199,10 @@ use crate::{
     place::{DefinedPlace, Definedness, Place, RequiresExplicitReExport, imported_symbol},
     types::{
         CallableTypes, ClassLiteral, IntersectionBuilder, NarrowingConstraint, Type, TypeContext,
-        UnionType, class_pattern_is_irrefutable, definite_match_pattern_type, enum_metadata,
-        infer_narrowing_constraints, infer_same_file_expression_type, mapping_pattern_type,
-        sequence_pattern_type_builder, singleton_pattern_type,
+        UnionType, class_pattern_is_exhaustive, definite_match_pattern_type, enum_metadata,
+        exhaustive_match_pattern_type, infer_narrowing_constraints,
+        infer_same_file_expression_type, mapping_pattern_type, sequence_pattern_type_builder,
+        singleton_pattern_type,
     },
 };
 use ruff_index::IndexSlice;
@@ -269,7 +270,7 @@ fn type_narrowed_by_pattern<'db>(
 ) -> Type<'db> {
     IntersectionBuilder::new(db)
         .add_positive(subject_ty)
-        .add_negative(definite_match_pattern_type(db, predicate.kind(db)))
+        .add_negative(exhaustive_match_pattern_type(db, predicate.kind(db)))
         .build()
 }
 
@@ -1000,7 +1001,7 @@ fn analyze_single_pattern_predicate_kind<'db>(
             class.map_or(Truthiness::Ambiguous, |class| {
                 let class_ty = Type::instance(db, class.top_materialization(db));
                 if subject_ty.is_subtype_of(db, class_ty) {
-                    if class_pattern_is_irrefutable(db, class, *kind) {
+                    if class_pattern_is_exhaustive(db, class, *kind) {
                         Truthiness::AlwaysTrue
                     } else {
                         // A class pattern like `case Point(x=0, y=0)` is not irrefutable,
