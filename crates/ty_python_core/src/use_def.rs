@@ -249,6 +249,7 @@ use thin_vec::ThinVec;
 
 use crate::ast_ids::ScopedUseId;
 use crate::definition::{Definition, DefinitionState};
+use crate::frozen::FrozenMap;
 use crate::member::ScopedMemberId;
 use crate::narrowing_constraints::{ConstraintKey, ScopedNarrowingConstraint};
 use crate::place::{PlaceExprRef, ScopedPlaceId};
@@ -537,7 +538,7 @@ pub struct UseDefMap<'db> {
     ///
     /// If we see a binding to a `Final`-qualified symbol, we also need the bindings to find
     /// previous bindings to that symbol. If there are any, the assignment is invalid.
-    definitions_by_definition: FxHashMap<
+    definitions_by_definition: FrozenMap<
         Definition<'db>,
         DefinitionsAtDefinition<InternedBindingsId, InternedDeclarationsId>,
     >,
@@ -2032,12 +2033,11 @@ impl<'db> UseDefMapBuilder<'db> {
             DefinitionsAtDefinition<Bindings, Declarations>,
         >,
         place_state_interner: &mut PlaceStateInterner,
-    ) -> FxHashMap<
+    ) -> FrozenMap<
         Definition<'db>,
         DefinitionsAtDefinition<InternedBindingsId, InternedDeclarationsId>,
     > {
-        let mut interned_ids_by_definition =
-            FxHashMap::with_capacity_and_hasher(definitions_by_definition.len(), FxBuildHasher);
+        let mut interned_ids_by_definition = Vec::with_capacity(definitions_by_definition.len());
 
         for (
             definition,
@@ -2050,16 +2050,16 @@ impl<'db> UseDefMapBuilder<'db> {
             let bindings = place_state_interner.intern_bindings(bindings);
             let declarations = declarations
                 .map(|declarations| place_state_interner.intern_declarations(declarations));
-            interned_ids_by_definition.insert(
+            interned_ids_by_definition.push((
                 definition,
                 DefinitionsAtDefinition {
                     bindings,
                     declarations,
                 },
-            );
+            ));
         }
 
-        interned_ids_by_definition
+        FrozenMap::from_entries(interned_ids_by_definition)
     }
 
     fn intern_bindings_by_use(
