@@ -515,7 +515,7 @@ Operations that need to rearrange individual members of a type variable tuple ca
 for each supported tuple length.
 
 ```py
-from typing import overload
+from typing import Any, overload
 
 class Row[*Cells]:
     def cells(self) -> tuple[*Cells]:
@@ -525,7 +525,7 @@ class Row[*Cells]:
     def rotate_left[A, B](self: "Row[A, B]") -> "Row[B, A]": ...
     @overload
     def rotate_left[A, B, C](self: "Row[A, B, C]") -> "Row[B, C, A]": ...
-    def rotate_left(self) -> "Row":
+    def rotate_left(self) -> "Row[*tuple[Any, ...]]":
         raise NotImplementedError
 
 def f(pair: Row[int, str], triple: Row[int, str, bytes]) -> None:
