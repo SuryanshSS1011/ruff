@@ -33,6 +33,7 @@ mod commands;
 mod completions;
 mod configuration;
 mod folding_range;
+mod hover;
 mod initialize;
 mod inlay_hints;
 mod notebook;
@@ -789,7 +790,6 @@ impl TestServer {
         self.test_context.root().join(path)
     }
 
-    #[expect(dead_code)]
     pub(crate) fn write_file(
         &self,
         path: impl AsRef<SystemPath>,
