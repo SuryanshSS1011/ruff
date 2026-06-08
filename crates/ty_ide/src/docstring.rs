@@ -200,6 +200,7 @@ fn render_markdown(docstring: &str) -> String {
     // and (possibly in a higher up piece of logic) try to resolve the names for
     // cross-linking. (Similar to `TypeDetails` in the type formatting code.)
     let mut output = String::new();
+    let mut inline_markup = InlineMarkupRenderer::default();
     let mut first_line = true;
     let mut block_indent = 0;
     let mut in_doctest = false;
@@ -213,17 +214,20 @@ fn render_markdown(docstring: &str) -> String {
         let trimmed_source_line = line.trim_start_matches(' ');
         let mut rendered_line = trimmed_source_line;
         let line_indent = line.len() - trimmed_source_line.len();
+        let mut line_prefix = String::new();
+        let mut candidate_line_prefix = String::new();
 
         // First thing's first, add a newline to start the new line
         if !first_line {
             // If we're not in a codeblock, add trailing space to the line to authentically wrap it
             // (Lines ending with two spaces tell markdown to preserve a linebreak)
             if !in_any_code {
-                output.push_str("  ");
+                line_prefix.push_str("  ");
             }
             // Only push newlines if we're not scanning for a real line
             if starting_literal.is_none() {
-                output.push('\n');
+                line_prefix.push('\n');
+                candidate_line_prefix.push('\n');
             }
         }
         first_line = false;
@@ -232,6 +236,10 @@ fn render_markdown(docstring: &str) -> String {
         // TODO: we should remove all the trailing blank lines
         // (Just pop all trailing `\n` from `output`?)
         if in_literal && line_indent < block_indent && !rendered_line.is_empty() {
+            inline_markup.flush_pending_as_plain(&mut output);
+            output.push_str(&line_prefix);
+            line_prefix.clear();
+            candidate_line_prefix.clear();
             in_literal = false;
             in_any_code = false;
             block_indent = 0;
@@ -244,6 +252,10 @@ fn render_markdown(docstring: &str) -> String {
         if let Some(literal) = starting_literal
             && !rendered_line.is_empty()
         {
+            inline_markup.flush_pending_as_plain(&mut output);
+            output.push_str(&line_prefix);
+            line_prefix.clear();
+            candidate_line_prefix.clear();
             starting_literal = None;
             in_literal = true;
             in_any_code = true;
@@ -256,6 +268,10 @@ fn render_markdown(docstring: &str) -> String {
 
         // If we're not in a codeblock and we see something that signals a doctest, start one
         if !in_any_code && rendered_line.starts_with(">>>") {
+            inline_markup.flush_pending_as_plain(&mut output);
+            output.push_str(&line_prefix);
+            line_prefix.clear();
+            candidate_line_prefix.clear();
             block_indent = line_indent;
             in_doctest = true;
             in_any_code = true;
@@ -266,6 +282,7 @@ fn render_markdown(docstring: &str) -> String {
 
         // If we're not in a codeblock and we see a markdown codefence, start one
         if !in_any_code && let Some(fence) = markdown::MarkdownFence::find(trimmed_source_line) {
+            inline_markup.flush_pending_as_plain(&mut output);
             // Unlike other blocks we don't need to emit fences because it's already markdown
             block_indent = line_indent;
             in_any_code = true;
@@ -284,16 +301,19 @@ fn render_markdown(docstring: &str) -> String {
             //
             // We "make this work" by stripping the indent on the fences but preserving the
             // full indent of the lines between the fences
+            output.push_str(&line_prefix);
             output.push_str(rendered_line);
             continue;
         // If we're in a markdown code fence and this line seems to terminate it, end the block
         } else if let Some(fence) = in_markdown_with_fence
             && fence.is_closed_by(rendered_line)
         {
+            inline_markup.flush_pending_as_plain(&mut output);
             in_any_code = false;
             block_indent = 0;
             in_markdown_with_fence = None;
             // Render the line without its indent and move on.
+            output.push_str(&line_prefix);
             output.push_str(rendered_line);
             continue;
         }
@@ -398,9 +418,11 @@ fn render_markdown(docstring: &str) -> String {
             if !in_any_code {
                 // TODO: would the raw unicode codepoint be handled *better* or *worse*
                 // by various IDEs? VS Code handles this approach well, at least.
-                output.push_str("&nbsp;");
+                line_prefix.push_str("&nbsp;");
+                candidate_line_prefix.push(' ');
             } else {
-                output.push(' ');
+                line_prefix.push(' ');
+                candidate_line_prefix.push(' ');
             }
         }
 
@@ -414,69 +436,15 @@ fn render_markdown(docstring: &str) -> String {
             // Things that need to be escaped: underscores and HTML-sensitive characters.
             //
             // e.g. we want __init__ => \_\_init\_\_ but `__init__` => `__init__`
-            let escape = |input: &str| {
-                input
-                    .replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;")
-                    .replace('_', "\\_")
-            };
-
-            let mut in_inline_code = false;
-            let mut first_chunk = true;
-            let mut opening_tick_count = 0;
-            let mut current_tick_count = 0;
-            for chunk in rendered_line.split('`') {
-                // First chunk is definitionally not in inline-code and so always plaintext
-                if first_chunk {
-                    first_chunk = false;
-                    output.push_str(&escape(chunk));
-                    continue;
-                }
-                // Not in first chunk, emit the ` between the last chunk and this one
-                output.push('`');
-                current_tick_count += 1;
-
-                // If we're in an inline block and have enough close-ticks to terminate it, do so.
-                // TODO: we parse ``hello```there` as (hello)(there) which probably isn't correct
-                // (definitely not for markdown) but it's close enough for horse grenades in this
-                // MVP impl. Notably we're verbatime emitting all the `'s so as long as reST and
-                // markdown agree we're *fine*. The accuracy of this parsing only affects the
-                // accuracy of where we apply escaping (so we need to misparse and see escapables
-                // for any of this to matter).
-                if opening_tick_count > 0 && current_tick_count >= opening_tick_count {
-                    opening_tick_count = 0;
-                    current_tick_count = 0;
-                    in_inline_code = false;
-                }
-
-                // If this chunk is completely empty we're just in a run of ticks, continue
-                if chunk.is_empty() {
-                    continue;
-                }
-
-                // Ok the chunk is non-empty, our run of ticks is complete
-                if in_inline_code {
-                    // The previous check for >= open_tick_count didn't trip, so these can't close
-                    // and these ticks will be verbatim rendered in the content
-                    current_tick_count = 0;
-                } else if current_tick_count > 0 {
-                    // Ok we're now in inline code
-                    opening_tick_count = current_tick_count;
-                    current_tick_count = 0;
-                    in_inline_code = true;
-                }
-
-                // Finally include the content either escaped or not
-                if in_inline_code {
-                    output.push_str(chunk);
-                } else {
-                    output.push_str(&escape(chunk));
-                }
-            }
-            // NOTE: explicitly not "flushing" the ticks here.
-            // We respect however the user closed their inline code.
+            inline_markup.render_line(
+                &mut output,
+                &line_prefix,
+                &candidate_line_prefix,
+                rendered_line,
+            );
         } else if rendered_line.is_empty() {
+            inline_markup.flush_pending_as_plain(&mut output);
+            output.push_str(&line_prefix);
             if in_doctest {
                 // This is the end of a doctest
                 block_indent = 0;
@@ -485,10 +453,13 @@ fn render_markdown(docstring: &str) -> String {
                 output.push_str(FENCE);
             }
         } else {
+            inline_markup.flush_pending_as_plain(&mut output);
+            output.push_str(&line_prefix);
             // Print the line verbatim, it's in code
             output.push_str(rendered_line);
         }
     }
+    inline_markup.flush_pending_as_plain(&mut output);
     // Flush codeblock
     if in_any_code {
         output.push('\n');
@@ -500,6 +471,306 @@ fn render_markdown(docstring: &str) -> String {
     }
 
     output
+}
+
+/// Renders inline markup while buffering possible reST hyperlinks that wrap across lines.
+#[derive(Default)]
+struct InlineMarkupRenderer {
+    pending_hyperlink: Option<PendingRestHyperlink>,
+}
+
+impl InlineMarkupRenderer {
+    fn render_line(
+        &mut self,
+        output: &mut String,
+        fallback_prefix: &str,
+        candidate_prefix: &str,
+        line: &str,
+    ) {
+        if let Some(pending_hyperlink) = &mut self.pending_hyperlink {
+            pending_hyperlink.push_line(fallback_prefix, candidate_prefix, line);
+            if line.is_empty() {
+                self.flush_pending_as_plain(output);
+            } else {
+                self.render_pending_hyperlink(output);
+            }
+        } else {
+            output.push_str(fallback_prefix);
+            self.render_fragment(output, line);
+        }
+    }
+
+    fn flush_pending_as_plain(&mut self, output: &mut String) {
+        if let Some(pending_hyperlink) = self.pending_hyperlink.take() {
+            pending_hyperlink.render_as_plain(output);
+        }
+    }
+
+    fn render_pending_hyperlink(&mut self, output: &mut String) {
+        let Some(pending_hyperlink) = self.pending_hyperlink.take() else {
+            return;
+        };
+
+        if let Some(hyperlink) = RestHyperlink::parse(&pending_hyperlink.candidate) {
+            hyperlink.render_markdown(output);
+            let remaining = pending_hyperlink.candidate[hyperlink.len..].to_owned();
+            self.render_fragment(output, &remaining);
+        } else {
+            self.pending_hyperlink = Some(pending_hyperlink);
+        }
+    }
+
+    fn render_fragment(&mut self, output: &mut String, line: &str) {
+        let mut rest = line;
+
+        while let Some(opening_index) = rest.find('`') {
+            push_escaped_markdown_text(output, &rest[..opening_index]);
+            rest = &rest[opening_index..];
+
+            if let Some(hyperlink) = RestHyperlink::parse(rest) {
+                hyperlink.render_markdown(output);
+                rest = &rest[hyperlink.len..];
+                continue;
+            }
+
+            if RestHyperlink::can_start_wrapped(rest) {
+                self.pending_hyperlink = Some(PendingRestHyperlink::new(rest));
+                return;
+            }
+
+            render_inline_code_or_text(output, rest, &mut rest);
+        }
+
+        push_escaped_markdown_text(output, rest);
+    }
+}
+
+struct PendingRestHyperlink {
+    candidate: String,
+    fallback: String,
+}
+
+impl PendingRestHyperlink {
+    fn new(first_line: &str) -> Self {
+        let mut fallback = String::new();
+        render_inline_markup_line(&mut fallback, first_line);
+
+        Self {
+            candidate: first_line.to_owned(),
+            fallback,
+        }
+    }
+
+    fn push_line(&mut self, fallback_prefix: &str, candidate_prefix: &str, line: &str) {
+        self.candidate.push_str(candidate_prefix);
+        self.candidate.push_str(line);
+        self.fallback.push_str(fallback_prefix);
+        render_inline_markup_line(&mut self.fallback, line);
+    }
+
+    fn render_as_plain(self, output: &mut String) {
+        output.push_str(&self.fallback);
+    }
+}
+
+fn render_inline_markup_line(output: &mut String, line: &str) {
+    let mut rest = line;
+
+    while let Some(opening_index) = rest.find('`') {
+        push_escaped_markdown_text(output, &rest[..opening_index]);
+        rest = &rest[opening_index..];
+
+        if let Some(hyperlink) = RestHyperlink::parse(rest) {
+            hyperlink.render_markdown(output);
+            rest = &rest[hyperlink.len..];
+            continue;
+        }
+
+        render_inline_code_or_text(output, rest, &mut rest);
+    }
+
+    push_escaped_markdown_text(output, rest);
+}
+
+fn render_inline_code_or_text<'a>(output: &mut String, input: &'a str, rest: &mut &'a str) {
+    let tick_count = input.bytes().take_while(|byte| *byte == b'`').count();
+    let delimiter = &input[..tick_count];
+    let after_opening = &input[tick_count..];
+
+    output.push_str(delimiter);
+
+    let Some(closing_index) = find_closing_backtick_run(after_opening, tick_count) else {
+        output.push_str(after_opening);
+        *rest = "";
+        return;
+    };
+
+    output.push_str(&after_opening[..closing_index]);
+    output.push_str(delimiter);
+    *rest = &after_opening[closing_index + tick_count..];
+}
+
+fn find_closing_backtick_run(input: &str, opening_tick_count: usize) -> Option<usize> {
+    let mut offset = 0;
+
+    while let Some(index) = input[offset..].find('`') {
+        let index = offset + index;
+        let tick_count = input[index..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
+
+        if tick_count >= opening_tick_count {
+            return Some(index);
+        }
+
+        offset = index + tick_count;
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestHyperlink<'a> {
+    text: &'a str,
+    target: &'a str,
+    len: usize,
+}
+
+impl<'a> RestHyperlink<'a> {
+    fn parse(input: &'a str) -> Option<Self> {
+        if !input.starts_with('`') || input.as_bytes().get(1) == Some(&b'`') {
+            return None;
+        }
+
+        let after_opening = &input[1..];
+        let closing_index = after_opening.find('`')?;
+        let after_closing = &after_opening[closing_index + 1..];
+        let underscore_count = after_closing
+            .bytes()
+            .take_while(|byte| *byte == b'_')
+            .count();
+        if !(1..=2).contains(&underscore_count) {
+            return None;
+        }
+
+        let content = &after_opening[..closing_index];
+        let (text, target) = Self::parse_text_and_target(content)?;
+        Some(Self {
+            text,
+            target,
+            len: 1 + closing_index + 1 + underscore_count,
+        })
+    }
+
+    fn parse_text_and_target(content: &'a str) -> Option<(&'a str, &'a str)> {
+        let content = content.trim();
+        let target_start = content.rfind('<')?;
+        if !content.ends_with('>') {
+            return None;
+        }
+
+        let before_target = &content[..target_start];
+        if !before_target
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+        {
+            return None;
+        }
+
+        let text = before_target.trim();
+        let target = content[target_start + 1..content.len() - 1].trim();
+        (!text.is_empty() && !target.is_empty()).then_some((text, target))
+    }
+
+    fn can_start_wrapped(input: &str) -> bool {
+        input.starts_with('`')
+            && input.as_bytes().get(1) != Some(&b'`')
+            && !input[1..].contains('`')
+    }
+
+    fn render_markdown(&self, output: &mut String) {
+        output.push('[');
+        push_escaped_markdown_link_text(output, self.text);
+        output.push_str("](");
+        push_markdown_link_destination(output, self.target);
+        output.push(')');
+    }
+}
+
+fn push_escaped_markdown_text(output: &mut String, input: &str) {
+    for char in input.chars() {
+        match char {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '_' => output.push_str("\\_"),
+            _ => output.push(char),
+        }
+    }
+}
+
+fn push_escaped_markdown_link_text(output: &mut String, input: &str) {
+    let mut pending_whitespace = false;
+
+    for char in input.chars() {
+        if char.is_whitespace() {
+            pending_whitespace = true;
+            continue;
+        }
+
+        if pending_whitespace {
+            output.push(' ');
+            pending_whitespace = false;
+        }
+
+        match char {
+            '[' | ']' | '\\' => {
+                output.push('\\');
+                output.push(char);
+            }
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '_' => output.push_str("\\_"),
+            _ => output.push(char),
+        }
+    }
+}
+
+fn push_markdown_link_destination(output: &mut String, input: &str) {
+    let mut chars = input.chars().peekable();
+
+    while let Some(char) = chars.next() {
+        if char.is_whitespace() {
+            let mut has_line_break = matches!(char, '\n' | '\r');
+            let mut whitespace_count = 1;
+
+            while let Some(char) = chars.next_if(|char| char.is_whitespace()) {
+                has_line_break |= matches!(char, '\n' | '\r');
+                whitespace_count += 1;
+            }
+
+            if !has_line_break {
+                for _ in 0..whitespace_count {
+                    output.push_str("%20");
+                }
+            }
+
+            continue;
+        }
+
+        match char {
+            '(' | ')' | '\\' => {
+                output.push('\\');
+                output.push(char);
+            }
+            '<' => output.push_str("%3C"),
+            '>' => output.push_str("%3E"),
+            _ => output.push(char),
+        }
+    }
 }
 
 /// Extract parameter documentation from Google-style docstrings.
@@ -870,6 +1141,47 @@ mod tests {
         <HB>
         So does `inline <code>`.
         "#);
+    }
+
+    #[test]
+    fn rest_hyperlinks() {
+        let _snap = bind_docstring_snapshot_filters();
+        let docstring = r#"
+        See `datetime-like <https://numpy.org/doc/stable/reference/arrays.datetime.html>`_ values.
+        Wrapped links render too: `timezone conversion and
+        localization
+        <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
+        #time-zone-handling>`_.
+        Anonymous links work too: `project docs <https://example.com/docs>`__.
+        Raw placeholders still escape: <scheme>://<netloc>/<path>.
+        Link text escapes: `name_with_[chars] & <tags> <https://example.com/a path?q=(value)>`_.
+
+        Markdown code fences keep reST links literal:
+
+        ```text
+        `not a link <https://example.com>`_
+        ```
+
+        Missing underscores stay as inline code: `not a link <https://example.com>`.
+        "#;
+
+        let docstring = Docstring::new(docstring.to_owned());
+
+        assert_snapshot!(docstring.render_markdown(), @r"
+        See [datetime-like](https://numpy.org/doc/stable/reference/arrays.datetime.html) values.<HB>
+        Wrapped links render too: [timezone conversion and localization](https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#time-zone-handling).<HB>
+        Anonymous links work too: [project docs](https://example.com/docs).<HB>
+        Raw placeholders still escape: &lt;scheme&gt;://&lt;netloc&gt;/&lt;path&gt;.<HB>
+        Link text escapes: [name\_with\_\[chars\] &amp; &lt;tags&gt;](https://example.com/a%20path?q=\(value\)).<HB>
+        <HB>
+        Markdown code fences keep reST links literal:<HB>
+        <HB>
+        ```text
+        `not a link <https://example.com>`_
+        ```<HB>
+        <HB>
+        Missing underscores stay as inline code: `not a link <https://example.com>`.
+        ");
     }
 
     // A literal block where the `::` is flush with the paragraph
